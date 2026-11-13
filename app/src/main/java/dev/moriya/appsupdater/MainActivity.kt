@@ -252,7 +252,17 @@ class MainActivity : Activity() {
                         textSize = 14f
                     })
                 }
+                var lastProject: String? = null
                 for (item in items) {
+                    if (item.project != lastProject) {
+                        lastProject = item.project
+                        itemsContainer.addView(TextView(this@MainActivity).apply {
+                            text = item.project
+                            textSize = 18f
+                            setTypeface(typeface, android.graphics.Typeface.BOLD)
+                            setPadding(0, dp(18), 0, dp(2))
+                        })
+                    }
                     addRow(item)
                 }
                 maybeRunAuto()
@@ -266,7 +276,7 @@ class MainActivity : Activity() {
             setPadding(0, dp(12), 0, dp(4))
         }
         block.addView(TextView(this).apply {
-            text = "${item.project} / ${item.fileName}"
+            text = item.fileName
             textSize = 16f
             setTypeface(typeface, android.graphics.Typeface.BOLD)
         })
@@ -370,10 +380,28 @@ class MainActivity : Activity() {
                 } ?: ""
                 when {
                     expected != null && !expected.equals(result.sha256, ignoreCase = true) -> {
-                        setRowStatus(
-                            row,
+                        // Name what actually arrived: when the Drive
+                        // app on the device still holds the previous
+                        // release in its cache, it can stream those
+                        // stale bytes for the same document even after
+                        // the server content was replaced — the
+                        // archive identity below makes that visible
+                        // instead of a bare "mismatch".
+                        val sb = StringBuilder(
                             "SHA-256 不一致のためインストールしません。期待 ${expected.take(12)}… / 実際 ${result.sha256.take(12)}…"
                         )
+                        if (archive != null) {
+                            sb.append("\nダウンロードされた実体: ${archive.packageName} ${archive.versionName} (code ${archive.longVersionCode})")
+                        }
+                        val expSize = item.update?.size
+                        if (expSize != null && expSize != result.bytes) {
+                            sb.append("\nサイズも不一致: 期待 $expSize / 実際 ${result.bytes}")
+                        }
+                        val expCode = item.update?.versionCode
+                        if (archive != null && expCode != null && archive.longVersionCode < expCode) {
+                            sb.append("\nDrive アプリに古いバージョンのキャッシュが残っている可能性があります。Drive アプリで対象ファイルを開き直してから、もう一度ダウンロードしてください。")
+                        }
+                        setRowStatus(row, sb.toString())
                         runOnUiThread { row.installButton.isEnabled = false }
                     }
                     expected != null -> {
