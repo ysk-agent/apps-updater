@@ -1,0 +1,39 @@
+<?xml version="1.0" encoding="utf-8"?>
+<manifest xmlns:android="http://schemas.android.com/apk/res/android">
+
+    <!-- Lets the app read the installed version of every app it
+         manages, including future ones not known at build time.
+         This is a personal, sideloaded tool and is not distributed
+         through Play, so the broad visibility is deliberate. -->
+    <uses-permission android:name="android.permission.QUERY_ALL_PACKAGES" />
+    <uses-permission android:name="android.permission.REQUEST_INSTALL_PACKAGES" />
+    <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
+
+    <application
+        android:label="Apps Updater"
+        android:theme="@android:style/Theme.Material.NoActionBar">
+
+        <activity
+            android:name=".MainActivity"
+            android:exported="true">
+            <intent-filter>
+                <action android:name="android.intent.action.MAIN" />
+                <category android:name="android.intent.category.LAUNCHER" />
+            </intent-filter>
+        </activity>
+
+        <!-- PackageInstaller session results for in-app installs.
+             Mirrors phone-node's UpdateReceiver: on
+             STATUS_PENDING_USER_ACTION it posts a high-importance
+             notification whose tap launches the confirmation, because
+             a direct activity start from a background receiver is
+             silently dropped on Android 10+. -->
+        <receiver
+            android:name=".InstallReceiver"
+            android:exported="false">
+            <intent-filter>
+                <action android:name="dev.moriya.appsupdater.INSTALL_STATUS" />
+            </intent-filter>
+        </receiver>
+    </application>
+</manifest>
