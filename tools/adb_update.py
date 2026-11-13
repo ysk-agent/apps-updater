@@ -52,6 +52,25 @@ def shell(adb: str, serial: str, command: str, timeout: int = 30) -> str:
     return run(adb, serial, ["shell", command], timeout=timeout)
 
 
+def shell_resilient(adb: str, serial: str, command: str, timeout: int = 60,
+                    attempts: int = 3) -> str:
+    """shell() with retries on transient adb/tunnel stalls.
+
+    The tailnet relay path used to reach the Libero occasionally
+    stalls a single adb call for tens of seconds while the next one
+    answers instantly, so one TimeoutExpired must not abort a run.
+    """
+    last: Exception | None = None
+    for i in range(attempts):
+        try:
+            return shell(adb, serial, command, timeout=timeout)
+        except subprocess.TimeoutExpired as e:
+            last = e
+            print(f"  (adb call timed out, retry {i + 1}/{attempts}: {command[:60]}...)")
+            time.sleep(5)
+    raise RuntimeError(f"adb call kept timing out: {command}") from last
+
+
 def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--project", required=True, help="Drive folder name, e.g. phone-node-waker")
@@ -77,8 +96,8 @@ def main() -> int:
 
     print(f"[1/3] triggering download of {args.project}/{args.file} in Apps Updater")
     if not args.no_force_stop:
-        shell(args.adb, args.serial, f"am force-stop {PKG}")
-    out = shell(
+        shell_resilient(args.adb, args.serial, f"am force-stop {PKG}")
+    out = shell_resilient(
         args.adb, args.serial,
         f"am start -n {PKG}/.MainActivity "
         f"--es auto_project {args.project} --es auto_file {args.file}",
@@ -89,7 +108,10 @@ def main() -> int:
     deadline = time.time() + args.timeout
     last_seen = ""
     while time.time() < deadline:
-        out = shell(args.adb, args.serial, f"sha256sum {remote}", timeout=15)
+        try:
+            out = shell(args.adb, args.serial, f"sha256sum {remote}", timeout=20)
+        except subprocess.TimeoutExpired:
+            out = ""
         got = out.strip().split()[0].lower() if out.strip() else ""
         if got and got != last_seen:
             print(f"  observed: {got}")
@@ -108,10 +130,13 @@ def main() -> int:
 
     print(f"[3/3] installing with pm install -r (staged via /data/local/tmp)")
     staged = f"/data/local/tmp/{args.file}"
-    out = shell(args.adb, args.serial, f"cp {remote} {staged}", timeout=120)
-    out = shell(args.adb, args.serial, f"pm install -r {staged}", timeout=300)
+    shell_resilient(args.adb, args.serial, f"cp {remote} {staged}", timeout=120)
+    out = shell_resilient(args.adb, args.serial, f"pm install -r {staged}", timeout=300)
     print(out.strip())
-    shell(args.adb, args.serial, f"rm -f {staged}", timeout=30)
+    try:
+        shell(args.adb, args.serial, f"rm -f {staged}", timeout=30)
+    except Exception:
+        pass
     if "Success" not in out:
         print("pm install did not report Success", file=sys.stderr)
         return 1
