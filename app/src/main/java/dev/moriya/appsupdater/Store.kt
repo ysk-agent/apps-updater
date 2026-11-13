@@ -189,7 +189,16 @@ object Store {
                 )
             }
         }
-        return items.sortedWith(compareBy({ it.project }, { it.fileName }))
+        // The Drive provider can surface the same document more than
+        // once (observed on a real device: the same app appearing in
+        // separated, duplicated rows). File names are unique per app
+        // in this tree, so collapse duplicates by file name, keeping
+        // the most recently modified copy.
+        val deduped = items
+            .groupBy { it.fileName.lowercase() }
+            .values
+            .map { group -> group.maxByOrNull { it.modified } ?: group.first() }
+        return deduped.sortedWith(compareBy({ it.project }, { it.fileName }))
     }
 
     /** Display name of the granted root folder, if resolvable. */

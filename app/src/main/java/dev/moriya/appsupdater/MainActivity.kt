@@ -252,18 +252,19 @@ class MainActivity : Activity() {
                         textSize = 14f
                     })
                 }
-                var lastProject: String? = null
-                for (item in items) {
-                    if (item.project != lastProject) {
-                        lastProject = item.project
-                        itemsContainer.addView(TextView(this@MainActivity).apply {
-                            text = item.project
-                            textSize = 18f
-                            setTypeface(typeface, android.graphics.Typeface.BOLD)
-                            setPadding(0, dp(18), 0, dp(2))
-                        })
+                // Group explicitly instead of relying on the scan's
+                // sort order: one header per project, every file of
+                // that project underneath it.
+                for ((project, groupItems) in items.groupBy { it.project }) {
+                    itemsContainer.addView(TextView(this@MainActivity).apply {
+                        text = project
+                        textSize = 18f
+                        setTypeface(typeface, android.graphics.Typeface.BOLD)
+                        setPadding(0, dp(18), 0, dp(2))
+                    })
+                    for (item in groupItems) {
+                        addRow(item)
                     }
-                    addRow(item)
                 }
                 maybeRunAuto()
             }
