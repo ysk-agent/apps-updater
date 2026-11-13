@@ -281,11 +281,43 @@ object Store {
 
     data class DownloadResult(val file: File, val sha256: String, val bytes: Long)
 
+    /** The bytes the provider streamed do not match update.json.
+     *  Carries what actually arrived so the UI can name it. */
+    class ShaMismatchException(
+        val expected: String,
+        val actual: String,
+        val bytes: Long,
+        val archivePackage: String?,
+        val archiveVersionName: String?,
+        val archiveVersionCode: Long?
+    ) : Exception("SHA-256 mismatch")
+
+    fun sha256Of(file: File): String {
+        val digest = MessageDigest.getInstance("SHA-256")
+        file.inputStream().use { input ->
+            val buf = ByteArray(256 * 1024)
+            while (true) {
+                val n = input.read(buf)
+                if (n < 0) break
+                digest.update(buf, 0, n)
+            }
+        }
+        return digest.digest().joinToString("") { "%02x".format(it) }
+    }
+
     /**
      * Copy the SAF document into internal storage, computing SHA-256 on
      * the way, then publish the same bytes into the public Downloads
      * folder via MediaStore so that `adb shell pm install` can install
      * exactly this file without any further transfer.
+     *
+     * When update.json carries a SHA-256 and the streamed bytes do not
+     * match it, the downloaded file is deleted again and
+     * [ShaMismatchException] is thrown: a mismatched file must never
+     * stay behind in installable form. (Observed on a real device:
+     * the Drive provider streamed a stale cached revision, the
+     * mismatch was reported — and after a refresh the still-present
+     * stale file could be installed as if it were the update.)
      */
     fun download(context: Context, item: ApkItem, onProgress: (Long, Long) -> Unit): DownloadResult {
         val target = downloadedFile(context, item.fileName)
@@ -311,6 +343,15 @@ object Store {
             tmp.delete()
         }
         val sha = digest.digest().joinToString("") { "%02x".format(it) }
+        val expected = item.update?.sha256
+        if (expected != null && !expected.equals(sha, ignoreCase = true)) {
+            val archive = archiveInfo(context, target)
+            target.delete()
+            throw ShaMismatchException(
+                expected, sha, copied,
+                archive?.packageName, archive?.versionName, archive?.longVersionCode
+            )
+        }
         publishToDownloads(context, target, item.fileName)
         writeDoneMarker(context, item, sha, copied)
         return DownloadResult(target, sha, copied)

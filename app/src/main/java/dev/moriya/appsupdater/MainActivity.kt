@@ -328,7 +328,15 @@ class MainActivity : Activity() {
         val rowButtons = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL }
         val installButton = Button(this).apply {
             text = "インストール"
-            isEnabled = Store.downloadedFile(this@MainActivity, item.fileName).exists()
+            // Enabled when a downloaded file exists and, where its
+            // hash was recorded, it still matches what update.json
+            // currently offers. The install action re-hashes the
+            // file itself, so this is only the visual gate.
+            val expectedSha = item.update?.sha256
+            val recordedSha = Store.downloadedSha(this@MainActivity, item.fileName)
+            isEnabled = Store.downloadedFile(this@MainActivity, item.fileName).exists() &&
+                (expectedSha == null || recordedSha == null ||
+                    expectedSha.equals(recordedSha, ignoreCase = true))
         }
         val row = Row(item, status, progress, installButton)
         rowButtons.addView(Button(this).apply {
@@ -380,31 +388,6 @@ class MainActivity : Activity() {
                     " / ${it.packageName} ${it.versionName} (code ${it.longVersionCode})"
                 } ?: ""
                 when {
-                    expected != null && !expected.equals(result.sha256, ignoreCase = true) -> {
-                        // Name what actually arrived: when the Drive
-                        // app on the device still holds the previous
-                        // release in its cache, it can stream those
-                        // stale bytes for the same document even after
-                        // the server content was replaced — the
-                        // archive identity below makes that visible
-                        // instead of a bare "mismatch".
-                        val sb = StringBuilder(
-                            "SHA-256 不一致のためインストールしません。期待 ${expected.take(12)}… / 実際 ${result.sha256.take(12)}…"
-                        )
-                        if (archive != null) {
-                            sb.append("\nダウンロードされた実体: ${archive.packageName} ${archive.versionName} (code ${archive.longVersionCode})")
-                        }
-                        val expSize = item.update?.size
-                        if (expSize != null && expSize != result.bytes) {
-                            sb.append("\nサイズも不一致: 期待 $expSize / 実際 ${result.bytes}")
-                        }
-                        val expCode = item.update?.versionCode
-                        if (archive != null && expCode != null && archive.longVersionCode < expCode) {
-                            sb.append("\nDrive アプリに古いバージョンのキャッシュが残っている可能性があります。Drive アプリで対象ファイルを開き直してから、もう一度ダウンロードしてください。")
-                        }
-                        setRowStatus(row, sb.toString())
-                        runOnUiThread { row.installButton.isEnabled = false }
-                    }
                     expected != null -> {
                         Store.setDownloadedSha(this, item.fileName, result.sha256)
                         setRowStatus(
@@ -422,6 +405,31 @@ class MainActivity : Activity() {
                         runOnUiThread { row.installButton.isEnabled = true }
                     }
                 }
+            } catch (e: Store.ShaMismatchException) {
+                // Name what actually arrived: when the Drive app on
+                // the device still holds a downloaded copy of the
+                // previous release, it can stream those stale bytes
+                // for the same document even after the server content
+                // was replaced — the archive identity below makes
+                // that visible instead of a bare "mismatch". The
+                // mismatched file itself has already been deleted by
+                // Store.download, so it cannot be installed later.
+                val sb = StringBuilder(
+                    "SHA-256 不一致のため破棄しました。期待 ${e.expected.take(12)}… / 実際 ${e.actual.take(12)}…"
+                )
+                if (e.archivePackage != null) {
+                    sb.append("\nダウンロードされた実体: ${e.archivePackage} ${e.archiveVersionName} (code ${e.archiveVersionCode})")
+                }
+                val expSize = item.update?.size
+                if (expSize != null && expSize != e.bytes) {
+                    sb.append("\nサイズも不一致: 期待 $expSize / 実際 ${e.bytes}")
+                }
+                val expCode = item.update?.versionCode
+                if (expCode != null && e.archiveVersionCode != null && e.archiveVersionCode < expCode) {
+                    sb.append("\nDrive アプリに古いバージョンのキャッシュが残っている可能性があります。Drive アプリで対象ファイルを開き直してから、もう一度ダウンロードしてください。")
+                }
+                setRowStatus(row, sb.toString())
+                runOnUiThread { row.installButton.isEnabled = false }
             } catch (e: Exception) {
                 setRowStatus(row, "ダウンロード失敗: ${e.javaClass.simpleName}: ${e.message}")
             } finally {
@@ -441,6 +449,21 @@ class MainActivity : Activity() {
         setRowStatus(row, "インストール中: ${item.fileName}")
         thread(name = "install-${item.fileName}", isDaemon = true) {
             try {
+                // Re-verify the stored file against update.json at
+                // install time: whatever sits in internal storage is
+                // what gets installed, so it must still be the
+                // artifact the current update.json describes.
+                val expected = item.update?.sha256
+                if (expected != null) {
+                    val actual = Store.sha256Of(Store.downloadedFile(this, item.fileName))
+                    if (!expected.equals(actual, ignoreCase = true)) {
+                        setRowStatus(
+                            row,
+                            "保存済みファイルの SHA-256 が現在の update.json と一致しないためインストールしません。期待 ${expected.take(12)}… / 実際 ${actual.take(12)}…（再ダウンロードしてください）"
+                        )
+                        return@thread
+                    }
+                }
                 Store.install(this, item)
             } catch (e: Exception) {
                 setRowStatus(row, "インストール開始に失敗: ${e.javaClass.simpleName}: ${e.message}")
