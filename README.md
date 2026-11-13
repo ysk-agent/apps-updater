@@ -50,10 +50,17 @@ python3 tools/adb_update.py \
   --sha256 <hex of the Drive file> --package dev.moriya.phonenode.waker
 ```
 
-It starts the app with `auto_project` / `auto_file` intent extras
-(the app downloads that one item), polls the SHA-256 of
-`/sdcard/Download/apps-updater/<file>` until it matches, then runs
-`pm install -r` and prints the installed version.
+It force-stops the app and starts it with `auto_project` /
+`auto_file` intent extras (the app downloads that one item), polls
+the SHA-256 of `/sdcard/Download/apps-updater/<file>` until it
+matches, then installs and prints the installed version. Two
+device findings from the Libero verification (2026-11-14) are baked
+in: an intent delivered to the already-running app instance was
+silently absorbed without triggering the auto flow (hence the
+force-stop, and the app's `singleTop` launch mode since v0.1.1),
+and `pm install` cannot read `/sdcard` paths there (FUSE scoped
+storage; system_server is denied), so the install stages the APK
+through `/data/local/tmp` with an on-device copy first.
 
 ## update.json format
 

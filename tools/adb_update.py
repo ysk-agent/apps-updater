@@ -2,15 +2,23 @@
 """VM-side orchestration for an Apps Updater driven update.
 
 Flow:
-  1. Ask the on-device Apps Updater (via an `am start` intent extra)
-     to download one APK from the Drive `apps` folder. The download
-     runs on the device, at the device's own line speed; nothing but
-     a few KB of commands crosses the adb link.
+  1. Force-stop Apps Updater, then ask it (via an `am start` intent
+     extra) to download one APK from the Drive `apps` folder. The
+     force-stop guarantees a fresh process takes the intent through
+     onCreate: an intent delivered to an already-running instance
+     proved unreliable on the ZTE Libero (absorbed without effect),
+     which is also why the app itself is singleTop since v0.1.1.
+     The download runs on the device, at the device's own line
+     speed; nothing but a few KB of commands crosses the adb link.
   2. Poll the downloaded copy in /sdcard/Download/apps-updater/ until
      its SHA-256 matches the expected value (the discriminator that
      the download is complete and intact).
   3. Install it with `adb shell pm install -r`, which needs no user
-     confirmation, and optionally verify the installed version.
+     confirmation, and optionally verify the installed version. The
+     APK is staged through /data/local/tmp first: on the Libero
+     (FUSE scoped storage) system_server cannot read /sdcard paths
+     for pm install (SELinux denial), while /data/local/tmp works.
+     The staging copy is made on-device; no bytes cross the link.
 
 Prerequisites: adb is connected to the device (any route: USB,
 wireless debugging, a relay), Apps Updater is installed, and its
@@ -55,7 +63,10 @@ def main() -> int:
     ap.add_argument("--timeout", type=int, default=600, help="download wait budget, seconds")
     ap.add_argument("--poll", type=int, default=3, help="poll interval, seconds")
     ap.add_argument("--no-install", action="store_true", help="download and verify only")
+    ap.add_argument("--no-force-stop", action="store_true",
+                    help="do not force-stop Apps Updater before triggering the download")
     args = ap.parse_args()
+    sys.stdout.reconfigure(line_buffering=True)
 
     for value in (args.project, args.file):
         if " " in value or "/" in value or "'" in value:
@@ -65,6 +76,8 @@ def main() -> int:
     remote = f"{REMOTE_DIR}/{args.file}"
 
     print(f"[1/3] triggering download of {args.project}/{args.file} in Apps Updater")
+    if not args.no_force_stop:
+        shell(args.adb, args.serial, f"am force-stop {PKG}")
     out = shell(
         args.adb, args.serial,
         f"am start -n {PKG}/.MainActivity "
@@ -93,9 +106,12 @@ def main() -> int:
         print("[3/3] skipped install (--no-install)")
         return 0
 
-    print(f"[3/3] installing with pm install -r")
-    out = shell(args.adb, args.serial, f"pm install -r {remote}", timeout=300)
+    print(f"[3/3] installing with pm install -r (staged via /data/local/tmp)")
+    staged = f"/data/local/tmp/{args.file}"
+    out = shell(args.adb, args.serial, f"cp {remote} {staged}", timeout=120)
+    out = shell(args.adb, args.serial, f"pm install -r {staged}", timeout=300)
     print(out.strip())
+    shell(args.adb, args.serial, f"rm -f {staged}", timeout=30)
     if "Success" not in out:
         print("pm install did not report Success", file=sys.stderr)
         return 1

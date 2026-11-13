@@ -13,9 +13,17 @@
         android:label="Apps Updater"
         android:theme="@android:style/Theme.Material.NoActionBar">
 
+        <!-- singleTop: an `am start` against the already-running
+             instance is then guaranteed to arrive via onNewIntent
+             (with the auto-download extras), instead of the intent
+             being silently absorbed by the running top instance on
+             some devices — observed on the ZTE Libero, where the
+             delivered-to-top path never triggered the auto flow and
+             duplicate instances stacked up. -->
         <activity
             android:name=".MainActivity"
-            android:exported="true">
+            android:exported="true"
+            android:launchMode="singleTop">
             <intent-filter>
                 <action android:name="android.intent.action.MAIN" />
                 <category android:name="android.intent.category.LAUNCHER" />
