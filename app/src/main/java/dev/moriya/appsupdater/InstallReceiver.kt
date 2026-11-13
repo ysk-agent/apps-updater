@@ -25,9 +25,17 @@ class InstallReceiver : BroadcastReceiver() {
         val status = intent.getIntExtra(PackageInstaller.EXTRA_STATUS, -99)
         val message = intent.getStringExtra(PackageInstaller.EXTRA_STATUS_MESSAGE) ?: ""
         val file = intent.getStringExtra(Store.EXTRA_FILE) ?: "(unknown)"
+        // Key the status to the artifact that was just installed, so
+        // it stops being shown once Drive offers a newer one.
+        val versionKey = try {
+            Store.archiveInfo(context, Store.downloadedFile(context, file))
+                ?.longVersionCode?.toString()
+        } catch (e: Exception) {
+            null
+        }
         when (status) {
             PackageInstaller.STATUS_PENDING_USER_ACTION -> {
-                Store.setStatus(context, file, "端末でのインストール確認待ち: $file")
+                Store.setStatus(context, file, "端末でのインストール確認待ち: $file", versionKey)
                 @Suppress("DEPRECATION")
                 val confirm = intent.getParcelableExtra<Intent>(Intent.EXTRA_INTENT)
                 if (confirm != null) {
@@ -44,13 +52,13 @@ class InstallReceiver : BroadcastReceiver() {
                 }
             }
             PackageInstaller.STATUS_SUCCESS -> {
-                Store.setStatus(context, file, "インストール完了: $file")
+                Store.setStatus(context, file, "インストール完了: $file", versionKey)
                 AppState.pendingConfirmIntent = null
                 AppState.pendingConfirmFile = null
                 cancelConfirmNotification(context)
             }
             else -> {
-                Store.setStatus(context, file, "インストール結果 status=$status $message: $file")
+                Store.setStatus(context, file, "インストール結果 status=$status $message: $file", versionKey)
                 AppState.pendingConfirmIntent = null
                 AppState.pendingConfirmFile = null
                 cancelConfirmNotification(context)

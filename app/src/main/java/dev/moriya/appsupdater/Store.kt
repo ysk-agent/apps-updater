@@ -44,6 +44,7 @@ object Store {
     private const val PREFS = "appsupdater-prefs"
     private const val KEY_TREE_URI = "tree_uri"
     private const val KEY_STATUS_PREFIX = "status_"
+    private const val KEY_STATUS_VER_PREFIX = "statusver_"
     private const val KEY_SHA_PREFIX = "sha_"
 
     const val ACTION_INSTALL_STATUS = "dev.moriya.appsupdater.INSTALL_STATUS"
@@ -71,14 +72,52 @@ object Store {
         context.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
             .getString(KEY_TREE_URI, null)?.let { Uri.parse(it) }
 
-    fun setStatus(context: Context, fileName: String, status: String) {
-        context.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
-            .edit().putString(KEY_STATUS_PREFIX + fileName, status).apply()
+    /**
+     * Persist a per-file status together with the key of the
+     * published artifact it was recorded against. Statuses outlive
+     * the release they belong to otherwise: a "SHA-256 mismatch"
+     * recorded against v0.1.2 was still displayed under v0.1.4's
+     * metadata on a real device, long after it stopped describing
+     * the current file. [statusFor] hides a status whose key no
+     * longer matches the artifact now being offered.
+     */
+    fun setStatus(context: Context, fileName: String, status: String, versionKey: String? = null) {
+        val edit = context.getSharedPreferences(PREFS, Context.MODE_PRIVATE).edit()
+            .putString(KEY_STATUS_PREFIX + fileName, status)
+        if (versionKey != null) {
+            edit.putString(KEY_STATUS_VER_PREFIX + fileName, versionKey)
+        } else {
+            edit.remove(KEY_STATUS_VER_PREFIX + fileName)
+        }
+        edit.apply()
     }
 
     fun status(context: Context, fileName: String): String? =
         context.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
             .getString(KEY_STATUS_PREFIX + fileName, null)
+
+    private fun statusKey(context: Context, fileName: String): String? =
+        context.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
+            .getString(KEY_STATUS_VER_PREFIX + fileName, null)
+
+    /** Key identifying the artifact an [ApkItem] currently offers. */
+    fun statusKeyFor(item: ApkItem): String? =
+        item.update?.sha256 ?: item.update?.buildId?.toString()
+            ?: item.update?.versionCode?.toString()
+
+    /** The persisted status, unless it was recorded against a
+     *  different artifact than the one [item] now offers. */
+    fun statusFor(context: Context, item: ApkItem): String? {
+        val text = status(context, item.fileName) ?: return null
+        val offered = listOfNotNull(
+            item.update?.versionCode?.toString(),
+            item.update?.buildId?.toString(),
+            item.update?.sha256
+        )
+        if (offered.isEmpty()) return text
+        val recorded = statusKey(context, item.fileName)
+        return if (recorded != null && recorded in offered) text else null
+    }
 
     fun setDownloadedSha(context: Context, fileName: String, sha: String) {
         context.getSharedPreferences(PREFS, Context.MODE_PRIVATE)

@@ -153,7 +153,7 @@ class MainActivity : Activity() {
         // Reflect install outcomes recorded by InstallReceiver while
         // this activity was not in front.
         for (row in rows) {
-            Store.status(this, row.item.fileName)?.let { row.status.text = it }
+            Store.statusFor(this, row.item)?.let { row.status.text = it }
         }
         confirmButton.visibility =
             if (AppState.pendingConfirmIntent != null) View.VISIBLE else View.GONE
@@ -315,7 +315,7 @@ class MainActivity : Activity() {
         })
         val status = TextView(this).apply {
             textSize = 13f
-            text = Store.status(this@MainActivity, item.fileName) ?: ""
+            text = Store.statusFor(this@MainActivity, item) ?: ""
         }
         block.addView(status)
         val progress = ProgressBar(this, null, android.R.attr.progressBarStyleHorizontal).apply {
@@ -349,7 +349,7 @@ class MainActivity : Activity() {
     // -- actions --------------------------------------------------------------
 
     private fun setRowStatus(row: Row, text: String, persist: Boolean = true) {
-        if (persist) Store.setStatus(this, row.item.fileName, text)
+        if (persist) Store.setStatus(this, row.item.fileName, text, Store.statusKeyFor(row.item))
         runOnUiThread { row.status.text = text }
     }
 
