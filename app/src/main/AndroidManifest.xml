@@ -7,6 +7,13 @@
          through Play, so the broad visibility is deliberate. -->
     <uses-permission android:name="android.permission.QUERY_ALL_PACKAGES" />
     <uses-permission android:name="android.permission.REQUEST_INSTALL_PACKAGES" />
+    <!-- Required alongside USER_ACTION_NOT_REQUIRED for unattended
+         updates on Android 12+: with it declared, an update session
+         needs no confirmation when this app is the installer of
+         record for the target (or is updating itself) and the target
+         meets the platform's targetSdk floor. Without the
+         declaration the system always asks. -->
+    <uses-permission android:name="android.permission.UPDATE_PACKAGES_WITHOUT_USER_ACTION" />
     <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
 
     <application
