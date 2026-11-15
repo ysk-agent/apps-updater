@@ -94,7 +94,13 @@ mkdir -p ci-test-assets
 head -c 8388608 /dev/urandom > ci-test-assets/ci-test.apk
 TEST_SHA=$(sha256sum ci-test-assets/ci-test.apk | cut -d' ' -f1)
 TEST_SIZE=$(stat -c%s ci-test-assets/ci-test.apk)
-(cd ci-test-assets && nohup python3 -m http.server 8123 >/dev/null 2>&1 &)
+# NOTE: the server must be killed before this script exits (see the
+# kill at the end of this section). A lingering background child
+# keeps the emulator-runner step open indefinitely — the first
+# v0.1.9 run passed every check in ~10 seconds and then hung the
+# step for 50 minutes on exactly this.
+python3 -m http.server 8123 --directory ci-test-assets >/dev/null 2>&1 &
+HTTP_PID=$!
 sleep 1
 
 adb shell am start -n $PKG/.MainActivity \
