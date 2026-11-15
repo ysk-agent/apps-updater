@@ -218,6 +218,7 @@ class MainActivity : Activity() {
             modified = 0L,
             update = UpdateInfo(
                 file = file,
+                buildId = null,
                 versionName = "9.9.9",
                 versionCode = 99L,
                 sha256 = sha,
