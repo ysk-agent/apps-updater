@@ -76,6 +76,76 @@ echo "PID after auto-extras launch: '$PID2'"
 check_top "auto-extras launch"
 screencap screenshot-auto.png
 
+# --- Foreground-service download test (v0.1.9) -------------------
+# Downloads used to die when the app was backgrounded because they
+# ran on an activity thread. They now run in DownloadService (a
+# foreground service). This section exercises that real path end to
+# end: a payload served from the runner host (the emulator reaches
+# it as 10.0.2.2; the app's network security config allows
+# cleartext to that address for exactly this test), started through
+# MainActivity's debug-only test extras.
+#
+# Success case: the .done.json marker appears and the published
+# file's SHA-256 matches the payload's.
+# Mismatch case: a wrong expected hash must produce NO marker and
+# NO published file (the mismatched bytes are deleted on the spot),
+# and a mismatch status must be recorded in the app's prefs.
+mkdir -p ci-test-assets
+head -c 8388608 /dev/urandom > ci-test-assets/ci-test.apk
+TEST_SHA=$(sha256sum ci-test-assets/ci-test.apk | cut -d' ' -f1)
+TEST_SIZE=$(stat -c%s ci-test-assets/ci-test.apk)
+(cd ci-test-assets && nohup python3 -m http.server 8123 >/dev/null 2>&1 &)
+sleep 1
+
+adb shell am start -n $PKG/.MainActivity \
+  --es test_file ci-test.apk \
+  --es test_url http://10.0.2.2:8123/ci-test.apk \
+  --es test_sha256 "$TEST_SHA" \
+  --el test_size "$TEST_SIZE"
+DL_OK=0
+for i in $(seq 1 30); do
+  if adb shell "test -e /sdcard/Download/apps-updater/ci-test.apk.done.json" 2>/dev/null; then
+    DL_OK=1; break
+  fi
+  sleep 2
+done
+if [ "$DL_OK" = 1 ]; then
+  echo "OK: foreground-service download produced the done marker"
+else
+  note_fail "foreground-service download did not produce the done marker within 60s"
+fi
+adb pull /sdcard/Download/apps-updater/ci-test.apk ci-test-downloaded.apk >/dev/null 2>&1 || true
+GOT_SHA=$(sha256sum ci-test-downloaded.apk 2>/dev/null | cut -d' ' -f1)
+if [ "$GOT_SHA" = "$TEST_SHA" ]; then
+  echo "OK: downloaded bytes match the payload SHA-256"
+else
+  note_fail "downloaded bytes SHA-256 mismatch (got '$GOT_SHA')"
+fi
+adb shell dumpsys activity services $PKG > dumpsys-services.txt 2>&1 || true
+
+BAD_SHA=0000000000000000000000000000000000000000000000000000000000000000
+adb shell am start -n $PKG/.MainActivity \
+  --es test_file ci-test-bad.apk \
+  --es test_url http://10.0.2.2:8123/ci-test.apk \
+  --es test_sha256 "$BAD_SHA" \
+  --el test_size "$TEST_SIZE"
+sleep 15
+if adb shell "test -e /sdcard/Download/apps-updater/ci-test-bad.apk.done.json" 2>/dev/null; then
+  note_fail "mismatched download produced a done marker (must be discarded)"
+else
+  echo "OK: mismatched download produced no done marker"
+fi
+if adb shell "test -e /sdcard/Download/apps-updater/ci-test-bad.apk" 2>/dev/null; then
+  note_fail "mismatched download was published to Download/ (must be discarded)"
+else
+  echo "OK: mismatched download was not published"
+fi
+if adb shell run-as $PKG cat shared_prefs/appsupdater-prefs.xml 2>/dev/null | grep -q "ci-test-bad.apk"; then
+  echo "OK: mismatch status recorded for ci-test-bad.apk"
+else
+  note_fail "no status recorded for the mismatched download"
+fi
+
 adb shell dumpsys activity activities > dumpsys-activities.txt 2>&1 || true
 adb logcat -d -v threadtime > logcat.txt 2>&1 || true
 adb shell uiautomator dump /sdcard/window_dump.xml >/dev/null 2>&1 || true

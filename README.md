@@ -13,27 +13,45 @@ flow: the phone downloads the APK itself, at its own line speed,
 through the Drive app's document provider; adb then only has to say
 "install this file that is already here".
 
-## GitHub Releases source (pilot, moka-vpn only)
+## GitHub Releases source
 
-Since v0.1.8, the moka-vpn row is fetched from GitHub Releases
-(`ysk-agent/moka-vpn`, tags of the form `vX.Y.Z`) over plain HTTPS
-instead of through the Drive provider: on a real device the
-provider kept serving the first-indexed generation of that folder
-(stale listing metadata and stale APK bytes for a brand-new
-document) while `update.json` read fresh. The GitHub row replaces
-the Drive row for `mokavpn.apk` whenever it can be fetched; the
-Drive row remains as the offline fallback. Downloads are verified
-against both `update.json`'s SHA-256 and the release asset's own
+Since v0.1.8 (moka-vpn pilot) and generalised in v0.1.9, every APK
+with a known publishing repository (see `GitHubSource.FILE_REPO`:
+moka-vpn, apps-updater, phone-node, phone-node-waker, yt-player)
+is fetched from GitHub Releases (tags of the form `vX.Y.Z`) over
+plain HTTPS instead of through the Drive provider: on a real
+device the provider kept serving the first-indexed generation of
+a folder (stale listing metadata and stale APK bytes for a
+brand-new document) while `update.json` read fresh. A GitHub row
+replaces the Drive row for the same file whenever it can be
+fetched; the Drive row remains as the offline fallback. Downloads
+are verified against both `update.json`'s SHA-256 (when the
+release carries one naming that file) and the release asset's own
 `digest` from the GitHub API. Selection does not use
 `/releases/latest` (an unrelated AAR-cache release holds that slot
-in the moka-vpn repository); the highest `vX.Y.Z` tag carrying both
-assets wins.
+in the moka-vpn repository); the highest `vX.Y.Z` tag carrying the
+file wins.
 
 For Drive items, a preflight guard compares the listing size with
 `update.json`'s stated size before downloading: a disagreement
 means the provider's view is stale, and the download is refused
 before any byte moves (the stale bytes would only be discarded on
 hash mismatch anyway, at metered-line cost).
+
+## Background downloads (v0.1.9)
+
+Downloads run in `DownloadService`, a foreground service with a
+progress notification. Before v0.1.9 they ran on a bare activity
+thread, and the system aborted the socket as soon as the app was
+backgrounded (`SocketException: Software caused connection
+abort`, observed on a real device during a 28 MB release
+download). The CI emulator test exercises this path end to end:
+it serves a payload from the runner host (emulator address
+`10.0.2.2`, the one cleartext exception in the network security
+config) through MainActivity's debug-only test extras, and checks
+the done marker, the published bytes' SHA-256, and that a
+mismatched download is discarded with no marker and no published
+file.
 
 ## How it works
 

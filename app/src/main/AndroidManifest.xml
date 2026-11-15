@@ -15,15 +15,23 @@
          declaration the system always asks. -->
     <uses-permission android:name="android.permission.UPDATE_PACKAGES_WITHOUT_USER_ACTION" />
     <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
-    <!-- GitHub Releases source (v0.1.8 pilot, moka-vpn only): the
-         on-device Drive provider served stale bytes for current
-         releases, so this one project is fetched over plain HTTPS
-         instead. No credentials: the repository is public. -->
+    <!-- GitHub Releases source (pilot in v0.1.8 for moka-vpn,
+         generalised in v0.1.9): the on-device Drive provider served
+         stale bytes for current releases, so known projects are
+         fetched over plain HTTPS instead. No credentials: the
+         repositories are public. -->
     <uses-permission android:name="android.permission.INTERNET" />
+    <!-- Foreground-service downloads (v0.1.9): transfers run in
+         DownloadService so backgrounding the app no longer aborts
+         them mid-download. dataSync is the Android 14+ service
+         type for data transfers and needs its own permission. -->
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_DATA_SYNC" />
 
     <application
         android:label="Apps Updater"
-        android:theme="@android:style/Theme.Material.NoActionBar">
+        android:theme="@android:style/Theme.Material.NoActionBar"
+        android:networkSecurityConfig="@xml/network_security_config">
 
         <!-- singleTop: an `am start` against the already-running
              instance is then guaranteed to arrive via onNewIntent
@@ -41,6 +49,13 @@
                 <category android:name="android.intent.category.LAUNCHER" />
             </intent-filter>
         </activity>
+
+        <!-- Owns APK downloads since v0.1.9. Not exported: only
+             MainActivity starts it. -->
+        <service
+            android:name=".DownloadService"
+            android:exported="false"
+            android:foregroundServiceType="dataSync" />
 
         <!-- PackageInstaller session results for in-app installs.
              Mirrors phone-node's UpdateReceiver: on

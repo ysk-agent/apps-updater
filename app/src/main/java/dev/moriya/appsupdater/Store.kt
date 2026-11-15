@@ -11,7 +11,6 @@ import android.net.Uri
 import android.os.Build
 import android.provider.DocumentsContract
 import android.provider.MediaStore
-import org.json.JSONArray
 import org.json.JSONObject
 import java.io.File
 import java.io.InputStream
@@ -22,8 +21,8 @@ import java.security.MessageDigest
 /** One APK offered by one of the sources.
  *
  * Drive items carry a [docUri] into the SAF tree. GitHub Releases
- * items (the v0.1.8 pilot covers moka-vpn only) carry a
- * [downloadUrl] and the release asset's own SHA-256 [assetDigest]
+ * items (piloted on moka-vpn in v0.1.8, generalised in v0.1.9)
+ * carry a [downloadUrl] and the release asset's own SHA-256 [assetDigest]
  * as reported by the GitHub API, so the download is verified
  * against two independent statements of the hash: update.json and
  * the asset record. */
@@ -183,7 +182,7 @@ object Store {
             null
         }
 
-    private fun parseUpdate(text: String): UpdateInfo? =
+    internal fun parseUpdate(text: String): UpdateInfo? =
         try {
             val j = JSONObject(text)
             UpdateInfo(
@@ -255,45 +254,11 @@ object Store {
         return deduped.sortedWith(compareBy({ it.project }, { it.fileName }))
     }
 
-    // -- GitHub Releases source (pilot: moka-vpn only) ---------------------
+    // -- item streams ---------------------------------------------------
     //
-    // Why this exists: on a real device the Drive documents provider
-    // kept serving the first-indexed generation of the moka-vpn
-    // folder — stale listing metadata and stale APK bytes for a
-    // brand-new document — while update.json (replaced in place)
-    // read fresh. The provider's folder view cannot be trusted for
-    // this project, so moka-vpn is fetched over plain HTTPS from
-    // GitHub Releases instead. The repository is public, so no
-    // credentials are involved.
-    //
-    // Release selection deliberately does NOT use /releases/latest:
-    // that endpoint currently resolves to an unrelated libtailscale
-    // AAR cache release in this repository. Only tags of the form
-    // vX.Y.Z with both the APK and update.json assets qualify, and
-    // the highest such version wins.
-
-    private const val GITHUB_REPO = "ysk-agent/moka-vpn"
-    private const val GITHUB_FILE = "mokavpn.apk"
-
-    private fun httpGet(url: String, accept: String): ByteArray? {
-        val conn = (URL(url).openConnection() as HttpURLConnection).apply {
-            requestMethod = "GET"
-            connectTimeout = 15_000
-            readTimeout = 60_000
-            instanceFollowRedirects = true
-            setRequestProperty("Accept", accept)
-            setRequestProperty("User-Agent", "AppsUpdater")
-            setRequestProperty("Cache-Control", "no-cache")
-        }
-        return try {
-            if (conn.responseCode !in 200..299) null
-            else conn.inputStream.use { it.readBytes() }
-        } catch (e: Exception) {
-            null
-        } finally {
-            conn.disconnect()
-        }
-    }
+    // Producing GitHub-sourced rows lives in GitHubSource (it was
+    // an in-Store moka-vpn-only pilot in v0.1.8). What stays here is
+    // the byte path shared by both sources:
 
     /** Stream for one item: HTTPS for GitHub items, the SAF
      *  document for Drive items. */
@@ -318,81 +283,6 @@ object Store {
             throw IllegalStateException("GitHub から取得できませんでした (HTTP $code)")
         }
         return conn.inputStream
-    }
-
-    private fun compareVersion(a: List<Int>, b: List<Int>): Int {
-        for (i in 0 until maxOf(a.size, b.size)) {
-            val d = a.getOrElse(i) { 0 } - b.getOrElse(i) { 0 }
-            if (d != 0) return d
-        }
-        return 0
-    }
-
-    /** The current moka-vpn release from GitHub, or null when it
-     *  cannot be determined (offline, rate-limited, malformed). A
-     *  null here must never hide the Drive row: the caller falls
-     *  back to whatever the Drive scan produced. */
-    fun scanGitHubMokaVpn(): ApkItem? {
-        val body = httpGet(
-            "https://api.github.com/repos/$GITHUB_REPO/releases?per_page=30",
-            "application/vnd.github+json"
-        ) ?: return null
-        return try {
-            val releases = JSONArray(String(body, Charsets.UTF_8))
-            var best: ApkItem? = null
-            var bestVersion: List<Int>? = null
-            val tagPattern = Regex("^v(\\d+)\\.(\\d+)\\.(\\d+)$")
-            for (i in 0 until releases.length()) {
-                val rel = releases.optJSONObject(i) ?: continue
-                if (rel.optBoolean("draft") || rel.optBoolean("prerelease")) continue
-                val m = tagPattern.matchEntire(rel.optString("tag_name")) ?: continue
-                val version = m.groupValues.drop(1).map { it.toInt() }
-                val assets = rel.optJSONArray("assets") ?: continue
-                var apkUrl: String? = null
-                var apkSize = -1L
-                var apkDigest: String? = null
-                var updateUrl: String? = null
-                for (j in 0 until assets.length()) {
-                    val a = assets.optJSONObject(j) ?: continue
-                    when (a.optString("name")) {
-                        GITHUB_FILE -> {
-                            apkUrl = a.optString("browser_download_url")
-                            apkSize = a.optLong("size", -1L)
-                            apkDigest = a.optString("digest")
-                                .removePrefix("sha256:").lowercase().ifEmpty { null }
-                        }
-                        "update.json" -> updateUrl = a.optString("browser_download_url")
-                    }
-                }
-                if (apkUrl == null || updateUrl == null) continue
-                val bv = bestVersion
-                if (bv != null && compareVersion(version, bv) <= 0) continue
-                val updateText = httpGet(updateUrl, "application/json")
-                    ?.let { String(it, Charsets.UTF_8) } ?: continue
-                val update = parseUpdate(updateText) ?: continue
-                if (update.file != GITHUB_FILE) continue
-                val modified = try {
-                    java.time.Instant.parse(rel.optString("published_at")).toEpochMilli()
-                } catch (e: Exception) {
-                    0L
-                }
-                best = ApkItem(
-                    project = "moka-vpn",
-                    fileName = GITHUB_FILE,
-                    docUri = null,
-                    size = if (apkSize > 0) apkSize else (update.size ?: -1L),
-                    modified = modified,
-                    update = update,
-                    source = "GitHub",
-                    downloadUrl = apkUrl,
-                    assetDigest = apkDigest
-                )
-                bestVersion = version
-            }
-            best
-        } catch (e: Exception) {
-            null
-        }
     }
 
     /** Display name of the granted root folder, if resolvable. */
@@ -519,6 +409,68 @@ object Store {
         publishToDownloads(context, target, item.fileName)
         writeDoneMarker(context, item, sha, copied)
         return DownloadResult(target, sha, copied)
+    }
+
+    /**
+     * Download one item end to end and compose + persist the
+     * status text the UI shows for the outcome. Used by
+     * DownloadService (the foreground service that owns transfers
+     * since v0.1.9); the activity no longer downloads on its own
+     * threads, because a backgrounded activity's process can have
+     * its sockets aborted mid-transfer — observed on a real device
+     * with "SocketException: Software caused connection abort"
+     * while pulling a 28 MB release asset.
+     *
+     * Returns the same text it persisted, so callers can broadcast
+     * it to a listening activity.
+     */
+    fun runDownload(
+        context: Context,
+        item: ApkItem,
+        onProgress: (Long, Long) -> Unit
+    ): String {
+        val text = try {
+            val result = download(context, item, onProgress)
+            setDownloadedSha(context, item.fileName, result.sha256)
+            val archive = archiveInfo(context, result.file)
+            val archiveText = archive?.let {
+                " / ${it.packageName} ${it.versionName} (code ${it.longVersionCode})"
+            } ?: ""
+            if (item.update?.sha256 != null) {
+                "ダウンロード完了・SHA-256 一致$archiveText\n" +
+                    "adb: $DOWNLOADS_ABS_DIR/${item.fileName}"
+            } else {
+                "ダウンロード完了（update.json に sha256 が無いため未照合）$archiveText\n" +
+                    "adb: $DOWNLOADS_ABS_DIR/${item.fileName}"
+            }
+        } catch (e: ShaMismatchException) {
+            // Name what actually arrived: when the Drive provider
+            // serves a stale generation, the archive identity makes
+            // that visible instead of a bare "mismatch". The
+            // mismatched file itself was already deleted by
+            // download(), so it cannot be installed later.
+            val sb = StringBuilder(
+                "SHA-256 不一致のため破棄しました。期待 ${e.expected.take(12)}… / 実際 ${e.actual.take(12)}…"
+            )
+            if (e.archivePackage != null) {
+                sb.append("\nダウンロードされた実体: ${e.archivePackage} ${e.archiveVersionName} (code ${e.archiveVersionCode})")
+            }
+            val expSize = item.update?.size
+            if (expSize != null && expSize != e.bytes) {
+                sb.append("\nサイズも不一致: 期待 $expSize / 実際 ${e.bytes}")
+            }
+            val expCode = item.update?.versionCode
+            if (item.source == "Drive" && expCode != null &&
+                e.archiveVersionCode != null && e.archiveVersionCode < expCode
+            ) {
+                sb.append("\n端末側の Drive プロバイダが古い世代の実体を返した可能性があります。")
+            }
+            sb.toString()
+        } catch (e: Exception) {
+            "ダウンロード失敗: ${e.javaClass.simpleName}: ${e.message}"
+        }
+        setStatus(context, item.fileName, text, statusKeyFor(item))
+        return text
     }
 
     private fun publishToDownloads(context: Context, source: File, fileName: String) {

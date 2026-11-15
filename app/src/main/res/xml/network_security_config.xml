@@ -1,0 +1,13 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- Cleartext is denied everywhere except the Android emulator's
+     host alias 10.0.2.2, which exists solely so the CI emulator
+     test can serve a payload over plain HTTP from the runner host
+     and exercise the real foreground-service download path end to
+     end. All production sources are HTTPS (GitHub) or the Drive
+     documents provider; nothing in production talks to 10.0.2.2. -->
+<network-security-config>
+    <domain-config cleartextTrafficPermitted="true">
+        <domain includeSubdomains="false">10.0.2.2</domain>
+    </domain-config>
+    <base-config cleartextTrafficPermitted="false" />
+</network-security-config>

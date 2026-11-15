@@ -1,7 +1,10 @@
 package dev.moriya.appsupdater
 
 import android.app.Activity
+import android.content.BroadcastReceiver
+import android.content.Context
 import android.content.Intent
+import android.content.IntentFilter
 import android.net.Uri
 import android.os.Build
 import android.os.Bundle
@@ -61,6 +64,7 @@ class MainActivity : Activity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         readAutoExtras(intent)
+        maybeRunTestDownload(intent)
 
         val root = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
@@ -136,13 +140,33 @@ class MainActivity : Activity() {
         ) {
             requestPermissions(arrayOf(android.Manifest.permission.POST_NOTIFICATIONS), 1)
         }
+        if (Build.VERSION.SDK_INT >= 33) {
+            registerReceiver(
+                downloadReceiver,
+                IntentFilter(DownloadService.ACTION_DOWNLOAD_STATE),
+                Context.RECEIVER_NOT_EXPORTED
+            )
+        } else {
+            @Suppress("UnspecifiedRegisterReceiverFlag")
+            registerReceiver(downloadReceiver, IntentFilter(DownloadService.ACTION_DOWNLOAD_STATE))
+        }
         refresh()
+    }
+
+    override fun onDestroy() {
+        try {
+            unregisterReceiver(downloadReceiver)
+        } catch (e: Exception) {
+            // Not registered (defensive; onCreate always registers).
+        }
+        super.onDestroy()
     }
 
     override fun onNewIntent(intent: Intent) {
         super.onNewIntent(intent)
         setIntent(intent)
         readAutoExtras(intent)
+        maybeRunTestDownload(intent)
         autoConsumed = false
         refresh()
     }
@@ -151,9 +175,12 @@ class MainActivity : Activity() {
         super.onResume()
         updateHeader()
         // Reflect install outcomes recorded by InstallReceiver while
-        // this activity was not in front.
+        // this activity was not in front, and download outcomes
+        // recorded by DownloadService (a download may have finished
+        // while this activity was backgrounded or recreated).
         for (row in rows) {
             Store.statusFor(this, row.item)?.let { row.status.text = it }
+            if (!row.downloading) refreshInstallEnabled(row)
         }
         confirmButton.visibility =
             if (AppState.pendingConfirmIntent != null) View.VISIBLE else View.GONE
@@ -162,6 +189,49 @@ class MainActivity : Activity() {
     private fun readAutoExtras(intent: Intent?) {
         autoProject = intent?.getStringExtra("auto_project")
         autoFile = intent?.getStringExtra("auto_file")
+    }
+
+    /**
+     * CI test hook (debug builds only): extras
+     *   --es test_file ci-test.apk --es test_url http://10.0.2.2:8123/ci-test.apk \
+     *   --es test_sha256 <hex> --el test_size <bytes>
+     * start a DownloadService download of a synthetic GitHub-shaped
+     * item, so the emulator test can exercise the real
+     * foreground-service download + hash-verify + publish path end
+     * to end without a network. Gated on FLAG_DEBUGGABLE: the
+     * release build ignores these extras entirely.
+     */
+    private fun maybeRunTestDownload(intent: Intent?) {
+        intent ?: return
+        if ((applicationInfo.flags and android.content.pm.ApplicationInfo.FLAG_DEBUGGABLE) == 0) {
+            return
+        }
+        val file = intent.getStringExtra("test_file") ?: return
+        val url = intent.getStringExtra("test_url") ?: return
+        val sha = intent.getStringExtra("test_sha256")
+        val size = intent.getLongExtra("test_size", -1L)
+        val item = ApkItem(
+            project = "ci-test",
+            fileName = file,
+            docUri = null,
+            size = size,
+            modified = 0L,
+            update = UpdateInfo(
+                file = file,
+                versionName = "9.9.9",
+                versionCode = 99L,
+                sha256 = sha,
+                size = if (size > 0) size else null
+            ),
+            source = "GitHub",
+            downloadUrl = url,
+            assetDigest = sha
+        )
+        try {
+            DownloadService.start(this, item)
+        } catch (e: Exception) {
+            Toast.makeText(this, "test download start failed: ${e.message}", Toast.LENGTH_LONG).show()
+        }
     }
 
     // -- header -------------------------------------------------------------
@@ -240,24 +310,24 @@ class MainActivity : Activity() {
                     emptyList()
                 }
             }
-            // GitHub Releases pilot (moka-vpn only): when the
-            // GitHub row is available it replaces the Drive row for
-            // the same file — the provider's view of that folder is
-            // exactly what cannot be trusted. When GitHub cannot be
-            // reached, the Drive row stays as the fallback.
-            val githubItem = try {
-                Store.scanGitHubMokaVpn()
-            } catch (e: Exception) {
-                null
-            }
-            val items = (
-                if (githubItem != null) {
-                    driveItems.filterNot {
-                        it.fileName.equals(githubItem.fileName, ignoreCase = true)
-                    } + githubItem
-                } else {
-                    driveItems
+            // GitHub Releases source (pilot for moka-vpn in v0.1.8,
+            // generalised in v0.1.9): for every file with a known
+            // publishing repo, an available GitHub row replaces the
+            // Drive row for the same file — the provider's view of
+            // those folders is exactly what cannot be trusted. When
+            // GitHub cannot be reached, the Drive row stays as the
+            // fallback.
+            val githubItems = GitHubSource.FILE_REPO.keys.mapNotNull { fileName ->
+                try {
+                    GitHubSource.fetchItem(fileName)
+                } catch (e: Exception) {
+                    null
                 }
+            }
+            val githubFiles = githubItems.map { it.fileName.lowercase() }.toSet()
+            val items = (
+                driveItems.filterNot { it.fileName.lowercase() in githubFiles } +
+                    githubItems
                 ).sortedWith(compareBy({ it.project }, { it.fileName }))
             runOnUiThread {
                 if (driveError != null) {
@@ -268,7 +338,7 @@ class MainActivity : Activity() {
                 }
                 if (Store.treeUri(this) == null) {
                     itemsContainer.addView(TextView(this@MainActivity).apply {
-                        text = "Drive の apps フォルダが未設定です。「フォルダを選ぶ」から指定すると Drive 側のアプリも表示されます（GitHub 側の moka-vpn は設定なしで表示されます）。"
+                        text = "Drive の apps フォルダが未設定です。「フォルダを選ぶ」から指定すると Drive 側のアプリも表示されます（GitHub 側の行は設定なしで表示されます）。"
                         textSize = 14f
                     })
                 }
@@ -412,81 +482,66 @@ class MainActivity : Activity() {
             )
             return
         }
+        // Since v0.1.9 the transfer itself runs in DownloadService,
+        // a foreground service: on a bare activity thread, the
+        // system aborted the socket as soon as the app was
+        // backgrounded. The service broadcasts progress/completion
+        // (see downloadReceiver); the outcome text is composed and
+        // persisted by Store.runDownload.
         row.downloading = true
-        runOnUiThread {
-            row.progress.visibility = View.VISIBLE
-            row.progress.isIndeterminate = item.size <= 0
-            row.progress.progress = 0
-        }
+        row.progress.visibility = View.VISIBLE
+        row.progress.isIndeterminate = item.size <= 0
+        row.progress.progress = 0
         setRowStatus(row, "ダウンロード中: ${item.fileName}")
-        thread(name = "download-${item.fileName}", isDaemon = true) {
-            try {
-                val result = Store.download(this, item) { copied, total ->
-                    runOnUiThread {
-                        if (total > 0) {
-                            row.progress.isIndeterminate = false
-                            row.progress.progress = ((copied * 100) / total).toInt()
-                        }
-                        row.status.text = "ダウンロード中: ${fmtSize(copied)} / ${fmtSize(total)}"
-                    }
+        try {
+            DownloadService.start(this, item)
+        } catch (e: Exception) {
+            row.downloading = false
+            row.progress.visibility = View.GONE
+            setRowStatus(row, "ダウンロード開始に失敗: ${e.javaClass.simpleName}: ${e.message}")
+        }
+    }
+
+    /** Progress/completion updates from DownloadService. */
+    private val downloadReceiver = object : BroadcastReceiver() {
+        override fun onReceive(context: Context?, intent: Intent?) {
+            intent ?: return
+            val fileName = intent.getStringExtra(DownloadService.EXTRA_FILE) ?: return
+            val row = rows.firstOrNull { it.item.fileName == fileName } ?: return
+            val done = intent.getBooleanExtra(DownloadService.EXTRA_DONE, false)
+            if (!done) {
+                val copied = intent.getLongExtra(DownloadService.EXTRA_COPIED, 0L)
+                val total = intent.getLongExtra(DownloadService.EXTRA_TOTAL, -1L)
+                row.progress.visibility = View.VISIBLE
+                if (total > 0) {
+                    row.progress.isIndeterminate = false
+                    row.progress.progress = ((copied * 100) / total).toInt()
                 }
-                val expected = item.update?.sha256
-                val archive = Store.archiveInfo(this, result.file)
-                val archiveText = archive?.let {
-                    " / ${it.packageName} ${it.versionName} (code ${it.longVersionCode})"
-                } ?: ""
-                when {
-                    expected != null -> {
-                        Store.setDownloadedSha(this, item.fileName, result.sha256)
-                        setRowStatus(
-                            row,
-                            "ダウンロード完了・SHA-256 一致$archiveText\nadb: ${Store.DOWNLOADS_ABS_DIR}/${item.fileName}"
-                        )
-                        runOnUiThread { row.installButton.isEnabled = true }
-                    }
-                    else -> {
-                        Store.setDownloadedSha(this, item.fileName, result.sha256)
-                        setRowStatus(
-                            row,
-                            "ダウンロード完了（update.json に sha256 が無いため未照合）$archiveText\nadb: ${Store.DOWNLOADS_ABS_DIR}/${item.fileName}"
-                        )
-                        runOnUiThread { row.installButton.isEnabled = true }
-                    }
-                }
-            } catch (e: Store.ShaMismatchException) {
-                // Name what actually arrived: when the Drive app on
-                // the device still holds a downloaded copy of the
-                // previous release, it can stream those stale bytes
-                // for the same document even after the server content
-                // was replaced — the archive identity below makes
-                // that visible instead of a bare "mismatch". The
-                // mismatched file itself has already been deleted by
-                // Store.download, so it cannot be installed later.
-                val sb = StringBuilder(
-                    "SHA-256 不一致のため破棄しました。期待 ${e.expected.take(12)}… / 実際 ${e.actual.take(12)}…"
-                )
-                if (e.archivePackage != null) {
-                    sb.append("\nダウンロードされた実体: ${e.archivePackage} ${e.archiveVersionName} (code ${e.archiveVersionCode})")
-                }
-                val expSize = item.update?.size
-                if (expSize != null && expSize != e.bytes) {
-                    sb.append("\nサイズも不一致: 期待 $expSize / 実際 ${e.bytes}")
-                }
-                val expCode = item.update?.versionCode
-                if (item.source == "Drive" && expCode != null &&
-                    e.archiveVersionCode != null && e.archiveVersionCode < expCode
-                ) {
-                    sb.append("\n端末側の Drive プロバイダが古い世代の実体を返した可能性があります。")
-                }
-                setRowStatus(row, sb.toString())
-                runOnUiThread { row.installButton.isEnabled = false }
-            } catch (e: Exception) {
-                setRowStatus(row, "ダウンロード失敗: ${e.javaClass.simpleName}: ${e.message}")
-            } finally {
+                row.status.text = "ダウンロード中: ${fmtSize(copied)} / ${fmtSize(total)}"
+            } else {
                 row.downloading = false
-                runOnUiThread { row.progress.visibility = View.GONE }
+                row.progress.visibility = View.GONE
+                val text = intent.getStringExtra(DownloadService.EXTRA_STATUS)
+                    ?: Store.statusFor(this@MainActivity, row.item)
+                if (text != null) row.status.text = text
+                refreshInstallEnabled(row)
             }
         }
+    }
+
+    /** The install button is usable when a downloaded file is on
+     *  disk and, where a download hash was recorded, it still
+     *  matches the currently offered artifact. (The install action
+     *  itself re-hashes the file, so this is only the visual gate;
+     *  it mirrors the initial state computed in addRow.) */
+    private fun refreshInstallEnabled(row: Row) {
+        val item = row.item
+        val downloadedSha = Store.downloadedSha(this, item.fileName)
+        val offeredSha = item.update?.sha256
+        row.installButton.isEnabled =
+            Store.downloadedFile(this, item.fileName).exists() &&
+                (offeredSha == null || downloadedSha == null ||
+                    offeredSha.equals(downloadedSha, ignoreCase = true))
     }
 
     private fun startInstall(row: Row) {
