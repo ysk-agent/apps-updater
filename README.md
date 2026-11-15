@@ -13,6 +13,28 @@ flow: the phone downloads the APK itself, at its own line speed,
 through the Drive app's document provider; adb then only has to say
 "install this file that is already here".
 
+## GitHub Releases source (pilot, moka-vpn only)
+
+Since v0.1.8, the moka-vpn row is fetched from GitHub Releases
+(`ysk-agent/moka-vpn`, tags of the form `vX.Y.Z`) over plain HTTPS
+instead of through the Drive provider: on a real device the
+provider kept serving the first-indexed generation of that folder
+(stale listing metadata and stale APK bytes for a brand-new
+document) while `update.json` read fresh. The GitHub row replaces
+the Drive row for `mokavpn.apk` whenever it can be fetched; the
+Drive row remains as the offline fallback. Downloads are verified
+against both `update.json`'s SHA-256 and the release asset's own
+`digest` from the GitHub API. Selection does not use
+`/releases/latest` (an unrelated AAR-cache release holds that slot
+in the moka-vpn repository); the highest `vX.Y.Z` tag carrying both
+assets wins.
+
+For Drive items, a preflight guard compares the listing size with
+`update.json`'s stated size before downloading: a disagreement
+means the provider's view is stale, and the download is refused
+before any byte moves (the stale bytes would only be discarded on
+hash mismatch anyway, at metered-line cost).
+
 ## How it works
 
 - One-time setup on the device: open the app, tap 「フォルダを選ぶ」,

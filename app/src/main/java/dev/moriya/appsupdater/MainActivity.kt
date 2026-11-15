@@ -226,25 +226,52 @@ class MainActivity : Activity() {
         updateHeader()
         itemsContainer.removeAllViews()
         rows.clear()
-        if (Store.treeUri(this) == null) {
-            itemsContainer.addView(TextView(this).apply {
-                text = "まず Drive の apps フォルダを選んでください。選択は端末に保持され、次回からは一覧がそのまま表示されます。"
-                textSize = 14f
-            })
-            return
-        }
         val loading = TextView(this).apply { text = "読み込み中…" }
         itemsContainer.addView(loading)
         thread(name = "scan", isDaemon = true) {
-            val items = try {
-                Store.scan(this)
-            } catch (e: Exception) {
-                runOnUiThread {
-                    loading.text = "読み込みに失敗しました: ${e.javaClass.simpleName}: ${e.message}"
+            var driveError: String? = null
+            val driveItems = if (Store.treeUri(this) == null) {
+                emptyList()
+            } else {
+                try {
+                    Store.scan(this)
+                } catch (e: Exception) {
+                    driveError = "${e.javaClass.simpleName}: ${e.message}"
+                    emptyList()
                 }
-                return@thread
             }
+            // GitHub Releases pilot (moka-vpn only): when the
+            // GitHub row is available it replaces the Drive row for
+            // the same file — the provider's view of that folder is
+            // exactly what cannot be trusted. When GitHub cannot be
+            // reached, the Drive row stays as the fallback.
+            val githubItem = try {
+                Store.scanGitHubMokaVpn()
+            } catch (e: Exception) {
+                null
+            }
+            val items = (
+                if (githubItem != null) {
+                    driveItems.filterNot {
+                        it.fileName.equals(githubItem.fileName, ignoreCase = true)
+                    } + githubItem
+                } else {
+                    driveItems
+                }
+                ).sortedWith(compareBy({ it.project }, { it.fileName }))
             runOnUiThread {
+                if (driveError != null) {
+                    itemsContainer.addView(TextView(this@MainActivity).apply {
+                        text = "Drive の読み込みに失敗しました: $driveError"
+                        textSize = 14f
+                    })
+                }
+                if (Store.treeUri(this) == null) {
+                    itemsContainer.addView(TextView(this@MainActivity).apply {
+                        text = "Drive の apps フォルダが未設定です。「フォルダを選ぶ」から指定すると Drive 側のアプリも表示されます（GitHub 側の moka-vpn は設定なしで表示されます）。"
+                        textSize = 14f
+                    })
+                }
                 itemsContainer.removeView(loading)
                 if (items.isEmpty()) {
                     itemsContainer.addView(TextView(this).apply {
@@ -282,7 +309,7 @@ class MainActivity : Activity() {
             setTypeface(typeface, android.graphics.Typeface.BOLD)
         })
         block.addView(TextView(this).apply {
-            text = "Drive: ${fmtSize(item.size)}" +
+            text = "${item.source}: ${fmtSize(item.size)}" +
                 (if (item.modified > 0) " • ${fmtDate(item.modified)}" else "")
             textSize = 13f
         })
@@ -363,8 +390,29 @@ class MainActivity : Activity() {
 
     private fun startDownload(row: Row) {
         if (row.downloading) return
-        row.downloading = true
         val item = row.item
+        // Preflight for Drive items: when update.json states a size
+        // and the provider's listing disagrees, the provider's view
+        // of the folder is stale (observed with moka-vpn: the
+        // listing still showed the previous generation while
+        // update.json was already current). Downloading would pull
+        // the stale bytes over a possibly metered line only to
+        // discard them on hash mismatch, so stop before any byte
+        // moves. GitHub items are exempt: their listing size comes
+        // from the same release record as update.json.
+        val offeredSize = item.update?.size
+        if (item.source == "Drive" && offeredSize != null && item.size > 0 &&
+            offeredSize != item.size
+        ) {
+            setRowStatus(
+                row,
+                "Drive 側の一覧が古い世代のままの可能性があります" +
+                    "（update.json: $offeredSize bytes / 一覧: ${item.size} bytes）。" +
+                    "ダウンロードを中止しました。"
+            )
+            return
+        }
+        row.downloading = true
         runOnUiThread {
             row.progress.visibility = View.VISIBLE
             row.progress.isIndeterminate = item.size <= 0
@@ -425,8 +473,10 @@ class MainActivity : Activity() {
                     sb.append("\nサイズも不一致: 期待 $expSize / 実際 ${e.bytes}")
                 }
                 val expCode = item.update?.versionCode
-                if (expCode != null && e.archiveVersionCode != null && e.archiveVersionCode < expCode) {
-                    sb.append("\nDrive アプリに古いバージョンのキャッシュが残っている可能性があります。Drive アプリで対象ファイルを開き直してから、もう一度ダウンロードしてください。")
+                if (item.source == "Drive" && expCode != null &&
+                    e.archiveVersionCode != null && e.archiveVersionCode < expCode
+                ) {
+                    sb.append("\n端末側の Drive プロバイダが古い世代の実体を返した可能性があります。")
                 }
                 setRowStatus(row, sb.toString())
                 runOnUiThread { row.installButton.isEnabled = false }

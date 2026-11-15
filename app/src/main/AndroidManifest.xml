@@ -15,6 +15,11 @@
          declaration the system always asks. -->
     <uses-permission android:name="android.permission.UPDATE_PACKAGES_WITHOUT_USER_ACTION" />
     <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
+    <!-- GitHub Releases source (v0.1.8 pilot, moka-vpn only): the
+         on-device Drive provider served stale bytes for current
+         releases, so this one project is fetched over plain HTTPS
+         instead. No credentials: the repository is public. -->
+    <uses-permission android:name="android.permission.INTERNET" />
 
     <application
         android:label="Apps Updater"

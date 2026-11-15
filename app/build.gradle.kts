@@ -11,8 +11,8 @@ android {
         applicationId = "dev.moriya.appsupdater"
         minSdk = 29
         targetSdk = 34
-        versionCode = 8
-        versionName = "0.1.7"
+        versionCode = 9
+        versionName = "0.1.8"
     }
 
     // Pinned signing key, same pattern as yt-player / phone-node-waker:
