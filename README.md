@@ -128,6 +128,7 @@ folder. All fields except `file` are optional; phone-node's legacy
 | phone-node-waker.apk | dev.moriya.phonenode.waker |
 | yt-player.apk | app.ytplayer |
 | apps-updater.apk | dev.moriya.appsupdater |
+| findmy-mac.apk | dev.moriya.findmymac |
 
 Unknown APKs still list, download, and install; their package name
 and version are read from the downloaded APK itself.

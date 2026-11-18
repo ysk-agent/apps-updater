@@ -151,6 +151,7 @@ if adb shell run-as $PKG cat shared_prefs/appsupdater-prefs.xml 2>/dev/null | gr
 else
   note_fail "no status recorded for the mismatched download"
 fi
+kill $HTTP_PID 2>/dev/null || true
 
 adb shell dumpsys activity activities > dumpsys-activities.txt 2>&1 || true
 adb logcat -d -v threadtime > logcat.txt 2>&1 || true
