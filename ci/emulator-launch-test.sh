@@ -189,23 +189,35 @@ kill $HTTP_PID 2>/dev/null || true
 # --- Failed-scan resilience (v0.2.2) ------------------------------
 # A scan whose API requests fail (rate limit, network down) must
 # keep the persisted rows on screen under a failure notice instead
-# of wiping the list. Exercise the real path: point api.github.com
-# at 127.0.0.1 in the emulator's hosts file so every API request
-# is refused, relaunch (onNewIntent re-runs the scan), and inspect
-# the UI. The scans above have already populated the persisted
-# last scan, which is what must survive. Best-effort: if the hosts
-# edit does not take effect in this emulator image (verified via
-# ping), the section skips with a note instead of failing.
+# of wiping the list. Exercise the real path: cut the emulator off
+# from api.github.com, relaunch (onNewIntent re-runs the scan),
+# and inspect the UI. The scans above have already populated the
+# persisted last scan, which is what must survive. Two blocking
+# methods, tried in order, each verified before use:
+#   1. /etc/hosts entry pointing api.github.com at 127.0.0.1
+#      (observed not to take effect in the API 35 default image:
+#      ping still resolved the real address after the append);
+#   2. airplane mode, which refuses every request device-side.
+# If neither verifiably blocks the API, the section skips with a
+# note instead of failing.
 adb root >/dev/null 2>&1 || true
 sleep 1
 adb remount >/dev/null 2>&1 || true
 adb shell "cp /etc/hosts /sdcard/hosts.bak" >/dev/null 2>&1 || true
 adb shell "echo '127.0.0.1 api.github.com' >> /etc/hosts" >/dev/null 2>&1 || true
-BLOCKED=0
+BLOCKED=""
 if adb shell ping -c 1 -W 2 api.github.com 2>/dev/null | head -1 | grep -q "127.0.0.1"; then
-  BLOCKED=1
+  BLOCKED="hosts"
 fi
-if [ "$BLOCKED" = 1 ]; then
+if [ -z "$BLOCKED" ]; then
+  adb shell cmd connectivity airplane-mode enable >/dev/null 2>&1 || true
+  sleep 2
+  if ! adb shell ping -c 1 -W 2 api.github.com >/dev/null 2>&1; then
+    BLOCKED="airplane"
+  fi
+fi
+echo "failure-path block method: ${BLOCKED:-none}"
+if [ -n "$BLOCKED" ]; then
   adb shell am start -n $PKG/.MainActivity >/dev/null 2>&1
   sleep 10
   adb shell uiautomator dump /sdcard/window_dump_fail.xml >/dev/null 2>&1 || true
@@ -223,9 +235,11 @@ if [ "$BLOCKED" = 1 ]; then
   fi
   screencap screenshot-failed-scan.png
 else
-  echo "NOTE: could not block api.github.com via /etc/hosts in this emulator; failure-path UI check skipped"
+  echo "NOTE: could not block api.github.com in this emulator; failure-path UI check skipped"
 fi
 adb shell "cp /sdcard/hosts.bak /etc/hosts" >/dev/null 2>&1 || true
+adb shell cmd connectivity airplane-mode disable >/dev/null 2>&1 || true
+sleep 2
 # Relaunch so the app re-scans with the API reachable again and
 # the sections below see the normal list.
 adb shell am start -n $PKG/.MainActivity >/dev/null 2>&1
