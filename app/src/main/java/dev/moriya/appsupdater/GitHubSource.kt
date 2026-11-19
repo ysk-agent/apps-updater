@@ -178,7 +178,7 @@ object GitHubSource {
         val pool = Executors.newFixedThreadPool(4)
         try {
             val known = loadKnownRepos(context)
-            Timing.log("github optimistic repos ${known.size}")
+            Timing.logLine("github optimistic repos ${known.size}")
             // Optimistic submissions: known repos start fetching
             // NOW, before (and while) discovery runs.
             val optimistic = LinkedHashMap<String, Future<List<ApkItem>>>()
