@@ -199,10 +199,13 @@ object Store {
 
     /** Scan the granted tree: one level of project folders, APKs inside. */
     fun scan(context: Context): List<ApkItem> {
+        // TEST BUILD (timing-test): per-folder and total timing.
+        val scanStart = Timing.now()
         val tree = treeUri(context) ?: return emptyList()
         val rootId = DocumentsContract.getTreeDocumentId(tree)
         val items = mutableListOf<ApkItem>()
         for (child in listChildren(context, tree, rootId)) {
+            val childStart = Timing.now()
             if (child.mime == DocumentsContract.Document.MIME_TYPE_DIR) {
                 val updateByFile = mutableMapOf<String, UpdateInfo>()
                 val apks = mutableListOf<Child>()
@@ -241,6 +244,7 @@ object Store {
                     )
                 )
             }
+            Timing.log("drive folder ${child.name}", Timing.now() - childStart)
         }
         // The Drive provider can surface the same document more than
         // once (observed on a real device: the same app appearing in
@@ -251,7 +255,9 @@ object Store {
             .groupBy { it.fileName.lowercase() }
             .values
             .map { group -> group.maxByOrNull { it.modified } ?: group.first() }
-        return deduped.sortedWith(compareBy({ it.project }, { it.fileName }))
+        val result = deduped.sortedWith(compareBy({ it.project }, { it.fileName }))
+        Timing.log("drive total", Timing.now() - scanStart)
+        return result
     }
 
     // -- item streams ---------------------------------------------------

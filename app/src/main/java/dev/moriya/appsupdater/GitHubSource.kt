@@ -82,31 +82,57 @@ object GitHubSource {
      *  arrays are stored, so a failed fetch never poisons a scan. */
     private val releasesCache = mutableMapOf<String, JSONArray>()
 
+    /** TEST BUILD (timing-test): breakdown of the most recent
+     *  [fetchAll] scan. fetchAll and everything it calls run on a
+     *  single scan thread, so plain fields are safe here. */
+    class ScanTimings {
+        var discoveryMs: Long? = null
+        var updateJsonMs: Long = 0L
+        var totalMs: Long? = null
+    }
+
+    @Volatile
+    var lastScanTimings: ScanTimings = ScanTimings()
+        private set
+
     /** Every GitHub-sourced item for one scan: topic discovery
      *  first, the hardcoded [FILE_REPO] map as fallback when
      *  discovery fails or returns no repositories. */
     fun fetchAll(): List<ApkItem> {
+        // TEST BUILD (timing-test): phase timing for this scan.
+        val totalStart = Timing.now()
+        val timings = ScanTimings()
+        lastScanTimings = timings
         // Per-scan cache: every scan starts from fresh release lists.
         synchronized(releasesCache) { releasesCache.clear() }
+        val discoveryStart = Timing.now()
         val repos = discoverRepos()
+        timings.discoveryMs = Timing.now() - discoveryStart
+        Timing.log("github discovery", timings.discoveryMs!!)
+        val result: List<ApkItem>
         if (repos.isNullOrEmpty()) {
-            return FILE_REPO.keys.mapNotNull { fileName ->
+            result = FILE_REPO.keys.mapNotNull { fileName ->
                 try {
                     fetchItem(fileName)
                 } catch (e: Exception) {
                     null
                 }
             }
-        }
-        val items = mutableListOf<ApkItem>()
-        for (repo in repos) {
-            try {
-                items += fetchRepoItems(repo)
-            } catch (e: Exception) {
-                // One bad repository must not sink the whole scan.
+        } else {
+            val items = mutableListOf<ApkItem>()
+            for (repo in repos) {
+                try {
+                    items += fetchRepoItems(repo)
+                } catch (e: Exception) {
+                    // One bad repository must not sink the whole scan.
+                }
             }
+            result = items
         }
-        return items
+        timings.totalMs = Timing.now() - totalStart
+        Timing.log("github update.json total", timings.updateJsonMs)
+        Timing.log("github total", timings.totalMs!!)
+        return result
     }
 
     /** The repositories carrying the watched topic, as
@@ -205,7 +231,10 @@ object GitHubSource {
         if (updateAsset != null) {
             val url = updateAsset.optString("browser_download_url")
             if (url.isNotEmpty()) {
+                // TEST BUILD (timing-test): accumulate update.json fetch time.
+                val updateJsonStart = Timing.now()
                 val text = httpGetText(url)
+                lastScanTimings.updateJsonMs += Timing.now() - updateJsonStart
                 if (text != null) {
                     val parsed = Store.parseUpdate(text)
                     if (parsed != null && parsed.file == fileName) update = parsed
@@ -233,6 +262,9 @@ object GitHubSource {
         synchronized(releasesCache) {
             if (releasesCache.containsKey(repo)) return releasesCache[repo]
         }
+        // TEST BUILD (timing-test): only real fetches are timed;
+        // per-scan cache hits return above without a log line.
+        val fetchStart = Timing.now()
         val text = httpGetText("https://api.github.com/repos/$repo/releases?per_page=30")
         val parsed = text?.let {
             try {
@@ -241,6 +273,7 @@ object GitHubSource {
                 null
             }
         }
+        Timing.log("github releases $repo", Timing.now() - fetchStart)
         // Cache only successful parses: a failed fetch must not
         // poison the rest of this scan (or any later one).
         if (parsed != null) {

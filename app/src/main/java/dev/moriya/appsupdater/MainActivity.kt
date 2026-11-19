@@ -44,8 +44,25 @@ class MainActivity : Activity() {
 
     private lateinit var sourceView: TextView
     private lateinit var permView: TextView
+    private lateinit var timingView: TextView
     private lateinit var confirmButton: Button
     private lateinit var itemsContainer: LinearLayout
+
+    /** TEST BUILD (timing-test): accumulated ms spent in the
+     *  per-row local-state lookups (installed version, downloaded
+     *  file / recorded SHA, persisted status) during row building.
+     *  Sub-millisecond calls are accumulated with nanoTime and
+     *  reported in ms; reset at the start of every refresh. */
+    @Volatile private var localStateMs: Long = 0L
+
+    private fun <T> timedLocal(block: () -> T): T {
+        val start = System.nanoTime()
+        try {
+            return block()
+        } finally {
+            localStateMs += (System.nanoTime() - start) / 1_000_000
+        }
+    }
 
     private var autoProject: String? = null
     private var autoFile: String? = null
@@ -129,6 +146,14 @@ class MainActivity : Activity() {
             textSize = 12f
         })
 
+        // TEST BUILD (timing-test): last scan's phase summary,
+        // persisted by Timing so it survives process restarts.
+        timingView = TextView(this).apply {
+            text = Timing.lastSummary(this@MainActivity) ?: "前回スキャン: -"
+            textSize = 12f
+        }
+        root.addView(timingView)
+
         itemsContainer = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
         root.addView(itemsContainer)
 
@@ -174,6 +199,8 @@ class MainActivity : Activity() {
     override fun onResume() {
         super.onResume()
         updateHeader()
+        // TEST BUILD (timing-test): keep the persisted summary visible.
+        Timing.lastSummary(this)?.let { timingView.text = it }
         // Reflect install outcomes recorded by InstallReceiver while
         // this activity was not in front, and download outcomes
         // recorded by DownloadService (a download may have finished
@@ -297,19 +324,26 @@ class MainActivity : Activity() {
         updateHeader()
         itemsContainer.removeAllViews()
         rows.clear()
+        localStateMs = 0L
         val loading = TextView(this).apply { text = "読み込み中…" }
         itemsContainer.addView(loading)
         thread(name = "scan", isDaemon = true) {
+            // TEST BUILD (timing-test): whole-scan and per-source timing.
+            val scanStart = Timing.now()
             var driveError: String? = null
+            var driveMs: Long? = null
             val driveItems = if (Store.treeUri(this) == null) {
                 emptyList()
             } else {
-                try {
+                val driveStart = Timing.now()
+                val scanned = try {
                     Store.scan(this)
                 } catch (e: Exception) {
                     driveError = "${e.javaClass.simpleName}: ${e.message}"
                     emptyList()
                 }
+                driveMs = Timing.now() - driveStart
+                scanned
             }
             // GitHub Releases source (pilot for moka-vpn in v0.1.8,
             // generalised in v0.1.9, topic discovery in v0.1.12):
@@ -321,11 +355,13 @@ class MainActivity : Activity() {
             // inside GitHubSource remains as the fallback for when
             // discovery itself fails. When GitHub cannot be
             // reached at all, the Drive row stays as the fallback.
+            val githubStart = Timing.now()
             val githubItems = try {
                 GitHubSource.fetchAll()
             } catch (e: Exception) {
                 emptyList()
             }
+            val githubMs = Timing.now() - githubStart
             val githubFiles = githubItems.map { it.fileName.lowercase() }.toSet()
             val items = (
                 driveItems.filterNot { it.fileName.lowercase() in githubFiles } +
@@ -365,6 +401,20 @@ class MainActivity : Activity() {
                         addRow(item)
                     }
                 }
+                // TEST BUILD (timing-test): whole-scan total runs
+                // from the scan thread's start to the end of row
+                // building, so it includes the per-row local-state
+                // lookups accumulated in localStateMs.
+                val totalMs = Timing.now() - scanStart
+                Timing.log("local state lookups (installed/downloaded, row build)", localStateMs)
+                Timing.log("scan total", totalMs)
+                val summary = "前回スキャン: 合計 ${Timing.fmt(totalMs)}ms / " +
+                    "Drive ${Timing.fmt(driveMs)}ms / " +
+                    "GitHub ${Timing.fmt(githubMs)}ms / " +
+                    "ローカル ${Timing.fmt(localStateMs)}ms"
+                Timing.logLine(summary)
+                Timing.saveSummary(this@MainActivity, summary)
+                timingView.text = summary
                 maybeRunAuto()
             }
         }
@@ -400,7 +450,7 @@ class MainActivity : Activity() {
         val installedText = when {
             knownPackage == null -> "パッケージ: ダウンロード後に判明"
             else -> {
-                val info = Store.installedInfo(this, knownPackage)
+                val info = timedLocal { Store.installedInfo(this, knownPackage) }
                 if (info == null) {
                     "インストール済み: なし（$knownPackage）"
                 } else {
@@ -414,7 +464,7 @@ class MainActivity : Activity() {
         })
         val status = TextView(this).apply {
             textSize = 13f
-            text = Store.statusFor(this@MainActivity, item) ?: ""
+            text = timedLocal { Store.statusFor(this@MainActivity, item) } ?: ""
         }
         block.addView(status)
         val progress = ProgressBar(this, null, android.R.attr.progressBarStyleHorizontal).apply {
@@ -432,8 +482,8 @@ class MainActivity : Activity() {
             // currently offers. The install action re-hashes the
             // file itself, so this is only the visual gate.
             val expectedSha = item.update?.sha256
-            val recordedSha = Store.downloadedSha(this@MainActivity, item.fileName)
-            isEnabled = Store.downloadedFile(this@MainActivity, item.fileName).exists() &&
+            val recordedSha = timedLocal { Store.downloadedSha(this@MainActivity, item.fileName) }
+            isEnabled = timedLocal { Store.downloadedFile(this@MainActivity, item.fileName).exists() } &&
                 (expectedSha == null || recordedSha == null ||
                     expectedSha.equals(recordedSha, ignoreCase = true))
         }
