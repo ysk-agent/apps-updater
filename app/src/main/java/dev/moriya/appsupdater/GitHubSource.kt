@@ -10,7 +10,6 @@ import java.util.concurrent.Callable
 import java.util.concurrent.ExecutorService
 import java.util.concurrent.Executors
 import java.util.concurrent.Future
-import java.util.concurrent.atomic.AtomicLong
 
 /**
  * GitHub Releases source — the ONLY source since v0.2.0 (the
@@ -25,9 +24,8 @@ import java.util.concurrent.atomic.AtomicLong
  * indexed, and there is no app-side way to force it current. A
  * public GitHub Release has no such layer: the asset bytes come
  * over HTTPS straight from GitHub, and the API reports a SHA-256
- * `digest` for every asset, so the download is verified twice
- * (against update.json and against the digest) before it can be
- * installed.
+ * `digest` for every asset, so the downloaded bytes are verified
+ * against it before they can be installed.
  *
  * Discovery (v0.1.12): the repositories to watch are no longer
  * only the hardcoded [FILE_REPO] map. The app searches GitHub for
@@ -47,34 +45,35 @@ import java.util.concurrent.atomic.AtomicLong
  * whose tag is not a version, and that release holds "Latest".
  * Only tags of the form vX.Y.Z qualify, and among those the
  * highest version that actually carries the requested file wins.
- * A release's update.json — the asset, or the copy embedded in
- * the release body (see below) — is honoured only when it names
- * the requested file (a release can carry several APKs; only the
- * primary one's metadata lives in update.json for now — other
- * files fall back to asset size + digest verification).
+ * The scan never downloads the update.json asset (publishers
+ * still attach one for other tooling): everything it needs is in
+ * the releases record — versionName from the tag, size and
+ * SHA-256 digest from the APK asset — plus the installed version
+ * from PackageManager. Update judgement therefore compares
+ * versionName tuples, not versionCodes (see Store.versionTuple);
+ * all watched projects publish monotonic X.Y.Z names, so ordering
+ * by name is sound. A file that update.json never named
+ * (phone-node's helper APK) is unaffected: its verification was
+ * always the asset digest.
  *
  * Scan speed (v0.2.0): on-device measurements (timing-test builds,
  * 2026-11-19) showed the GitHub phase was ~90% of an 8.2s scan
  * when repositories were fetched one after another. Three
  * measures, all verified on the timing-test branch:
  *  - repositories are fetched concurrently on a bounded pool
- *    (4 threads), futures joined in discovery order so the item
- *    order is identical to the sequential version's;
+ *    (8 threads — every watched repository in a single wave),
+ *    futures joined in discovery order so the item order is
+ *    identical to the sequential version's;
  *  - the scan starts optimistically from the repository list the
  *    previous successful discovery persisted (see [fetchAll]):
  *    those fetches run while discovery is still in flight;
  *  - API requests carry Cache-Control: no-cache, so a refresh
  *    always reads the current state;
- *  - the per-file update.json asset fetch is skipped whenever
- *    the chosen release embeds the same content in its body
- *    (marker line "<!-- update-json -->" + fenced json block):
- *    a VM benchmark put the repos phase at a 3,427ms median with
- *    those fetches vs 930ms releases-only, so this removes the
- *    dominant remaining cost. Old releases without the marker
- *    still fetch the asset.
- * The first three measures leave the request count per scan
- * unchanged; the fourth removes one request per published file
- * whose release carries the embedded block.
+ *  - the scan performs NO update.json requests at all (see the
+ *    selection note above): a VM benchmark put the repos phase
+ *    at a 3,427ms median with per-file update.json fetches vs
+ *    930ms releases-only, so this removes the dominant remaining
+ *    cost and one request per published file.
  *
  * All repositories are public; no token is used or needed. The
  * unauthenticated search API allows 10 requests/minute, far above
@@ -102,10 +101,6 @@ object GitHubSource {
     )
 
     private val VERSION_TAG = Regex("""^v(\d+)\.(\d+)\.(\d+)$""")
-
-    /** Marker line that introduces the update.json block embedded
-     *  in a release body (see parseEmbeddedUpdate). */
-    private const val UPDATE_JSON_MARKER = "<!-- update-json -->"
 
     /** Parsed releases array per repo, cached for ONE scan only:
      *  several files can share a repo (phone-node), and re-listing
@@ -147,14 +142,10 @@ object GitHubSource {
 
     // -- scan timing --------------------------------------------------
 
-    /** Breakdown of the most recent [fetchAll] scan. [discoveryMs]
-     *  and [totalMs] are written only by the thread that called
-     *  fetchAll. [updateJsonMs] is accumulated from the per-repo
-     *  worker threads (repositories are fetched concurrently), so
-     *  it is atomic. */
+    /** Breakdown of the most recent [fetchAll] scan, written
+     *  only by the thread that called fetchAll. */
     class ScanTimings {
         var discoveryMs: Long? = null
-        val updateJsonMs = AtomicLong(0L)
         var totalMs: Long? = null
     }
 
@@ -189,7 +180,7 @@ object GitHubSource {
         synchronized(releasesCache) { releasesCache.clear() }
         synchronized(repoFetchLocks) { repoFetchLocks.clear() }
 
-        val pool = Executors.newFixedThreadPool(4)
+        val pool = Executors.newFixedThreadPool(8)
         try {
             val known = loadKnownRepos(context)
             Timing.logLine("github optimistic repos ${known.size}")
@@ -228,7 +219,6 @@ object GitHubSource {
                 }
             }
             timings.totalMs = Timing.now() - totalStart
-            Timing.log("github update.json total", timings.updateJsonMs.get())
             Timing.log("github total", timings.totalMs!!)
             return result
         } finally {
@@ -332,6 +322,7 @@ object GitHubSource {
 
         var best: JSONObject? = null
         var bestKey: LongArray? = null
+        var bestTag: String? = null
         for (i in 0 until releases.length()) {
             val release = releases.optJSONObject(i) ?: continue
             if (release.optBoolean("draft") || release.optBoolean("prerelease")) continue
@@ -347,64 +338,43 @@ object GitHubSource {
             if (bestKey == null || key.compareVersionTo(bestKey!!) > 0) {
                 best = release
                 bestKey = key
+                bestTag = tag
             }
         }
         val release = best ?: return null
         val assets = release.optJSONArray("assets") ?: return null
         val apkAsset = findAsset(assets, fileName) ?: return null
 
-        // Version metadata, cheapest source first. Publishers
-        // also embed the update.json content in the release body
-        // (a line containing only "<!-- update-json -->", followed
-        // by a fenced json block — see parseEmbeddedUpdate). When
-        // the chosen release carries that block it is parsed from
-        // the already-downloaded release record and the
-        // update.json asset is NOT fetched: a VM benchmark showed
-        // the per-file update.json fetch was the dominant
-        // remaining scan cost (repos phase median 3,427ms with the
-        // fetches vs 930ms releases-only). The embedded block is
-        // authoritative for the whole release: when it names a
-        // different file (phone-node's helper APK), this file
-        // simply gets no update.json metadata — the asset holds
-        // the same content by convention, so fetching it could
-        // never change the outcome — and verification falls back
-        // to the asset digest, as before. Only releases without a
-        // parseable marker block (published before the convention)
-        // fall back to fetching the update.json asset, exactly as
-        // before. Either way the metadata is honoured only when
-        // it names this file; the asset digest/size stay the
-        // verification source.
-        var update: UpdateInfo? = null
-        val embedded = parseEmbeddedUpdate(release.optString("body"))
-        if (embedded != null) {
-            Timing.logLine("github update.json embedded $repo")
-            if (embedded.file == fileName) update = embedded
-        } else {
-            val updateAsset = findAsset(assets, "update.json")
-            if (updateAsset != null) {
-                val url = updateAsset.optString("browser_download_url")
-                if (url.isNotEmpty()) {
-                    // Accumulate update.json fetch time (atomic:
-                    // this runs on several worker threads
-                    // concurrently).
-                    val updateJsonStart = Timing.now()
-                    val text = httpGetText(url)
-                    lastScanTimings.updateJsonMs.addAndGet(Timing.now() - updateJsonStart)
-                    if (text != null) {
-                        val parsed = Store.parseUpdate(text)
-                        if (parsed != null && parsed.file == fileName) update = parsed
-                    }
-                }
-            }
-        }
-
         val digest = apkAsset.optString("digest")
             .removePrefix("sha256:").lowercase().ifEmpty { null }
         val assetSize = apkAsset.optLong("size", -1L)
+        // Releases-only metadata (v0.2.0): the scan NEVER fetches
+        // the update.json asset. Everything it needs is already in
+        // this release record — versionName from the tag, size and
+        // SHA-256 digest from the asset — plus the installed
+        // version from PackageManager on the UI side. (A VM
+        // benchmark put the repos phase at a 3,427ms median with
+        // per-file update.json fetches vs 930ms releases-only; the
+        // fetches were the dominant remaining scan cost.)
+        // Publishers still attach update.json for other tooling.
+        // The synthesized UpdateInfo carries the digest as its
+        // sha256, so download verification, the install gate and
+        // status keying work exactly as when it came from
+        // update.json (both state the APK's SHA-256). Files that
+        // update.json never named (phone-node's helper) are
+        // unaffected: their verification was always the digest.
+        val update = UpdateInfo(
+            file = fileName,
+            buildId = null,
+            versionName = bestTag?.removePrefix("v"),
+            versionCode = null,
+            sha256 = digest,
+            size = if (assetSize > 0) assetSize else null
+        )
         return ApkItem(
             project = repo.substringAfter('/'),
             fileName = fileName,
-            size = if (assetSize > 0) assetSize else (update?.size ?: -1L),
+            size = if (assetSize > 0) assetSize else -1L,
             modified = parseIsoTime(apkAsset.optString("updated_at")),
             update = update,
             source = "GitHub",
@@ -447,27 +417,6 @@ object GitHubSource {
         }
     }
 
-    /** The update.json content embedded in a release body, or
-     *  null when the body carries no marker block (or the block
-     *  does not parse — the caller then falls back to fetching
-     *  the update.json asset). Convention: a line containing only
-     *  [UPDATE_JSON_MARKER], followed by a fenced ```json block
-     *  holding the update.json object. */
-    private fun parseEmbeddedUpdate(body: String?): UpdateInfo? {
-        if (body.isNullOrEmpty()) return null
-        val markerAt = body.indexOf(UPDATE_JSON_MARKER)
-        if (markerAt < 0) return null
-        val fenceOpen = body.indexOf("```", markerAt + UPDATE_JSON_MARKER.length)
-        if (fenceOpen < 0) return null
-        val contentStart = body.indexOf('\n', fenceOpen)
-        if (contentStart < 0) return null
-        val fenceClose = body.indexOf("```", contentStart)
-        if (fenceClose < 0) return null
-        val json = body.substring(contentStart + 1, fenceClose).trim()
-        if (json.isEmpty()) return null
-        return Store.parseUpdate(json)
-    }
-
     private fun findAsset(assets: JSONArray, name: String): JSONObject? {
         for (i in 0 until assets.length()) {
             val asset = assets.optJSONObject(i) ?: continue
@@ -492,12 +441,13 @@ object GitHubSource {
         }
     }
 
-    /** Small text GET for API/update.json payloads. Asset bytes do
-     *  NOT go through here — Store streams those with progress and
-     *  hashing. Returns null on any failure: GitHub being
-     *  unreachable must never break the listing. Cache-Control:
-     *  no-cache makes every refresh read the current state instead
-     *  of an HTTP-cached response (v0.2.0). */
+    /** Small text GET for API payloads (discovery + release
+     *  lists). Asset bytes do NOT go through here — Store streams
+     *  those with progress and hashing. Returns null on any
+     *  failure: GitHub being unreachable must never break the
+     *  listing. Cache-Control: no-cache makes every refresh read
+     *  the current state instead of an HTTP-cached response
+     *  (v0.2.0). */
     private fun httpGetText(url: String): String? {
         var conn: HttpURLConnection? = null
         return try {

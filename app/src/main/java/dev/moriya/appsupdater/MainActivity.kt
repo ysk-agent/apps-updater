@@ -287,8 +287,20 @@ class MainActivity : Activity() {
         itemsContainer.removeAllViews()
         rows.clear()
         localStateMs = 0L
-        val loading = TextView(this).apply { text = "読み込み中…" }
-        itemsContainer.addView(loading)
+        // Stale-while-revalidate (v0.2.0): render the last completed
+        // scan's persisted rows immediately; the fresh scan replaces
+        // them when it lands. Downloads started from a stale row
+        // stay safe — the APK bytes are verified against the
+        // release asset's digest after download (Store.download).
+        // With no persisted scan (first run), show the loading line
+        // until the scan lands, as before.
+        val persisted = Store.loadLastScan(this)
+            .sortedWith(compareBy({ it.project }, { it.fileName }))
+        if (persisted.isNotEmpty()) {
+            renderItems(persisted)
+        } else {
+            itemsContainer.addView(TextView(this).apply { text = "読み込み中…" })
+        }
         thread(name = "scan", isDaemon = true) {
             // Whole-scan and GitHub-phase timing (see Timing).
             val scanStart = Timing.now()
@@ -306,30 +318,25 @@ class MainActivity : Activity() {
                 emptyList()
             }
             val githubMs = Timing.now() - githubStart
+            if (githubItems.isNotEmpty()) {
+                Store.saveLastScan(this, githubItems)
+            }
             val items = githubItems
                 .sortedWith(compareBy({ it.project }, { it.fileName }))
             runOnUiThread {
-                itemsContainer.removeView(loading)
+                itemsContainer.removeAllViews()
+                rows.clear()
+                // The timing summary describes the fresh scan, so
+                // its local-lookup accumulation starts here, not
+                // at the stale render above.
+                localStateMs = 0L
                 if (items.isEmpty()) {
                     itemsContainer.addView(TextView(this).apply {
                         text = "APK が見つかりませんでした。通信状態を確認して再読み込みしてください。"
                         textSize = 14f
                     })
                 }
-                // Group explicitly instead of relying on the scan's
-                // sort order: one header per project, every file of
-                // that project underneath it.
-                for ((project, groupItems) in items.groupBy { it.project }) {
-                    itemsContainer.addView(TextView(this@MainActivity).apply {
-                        text = project
-                        textSize = 18f
-                        setTypeface(typeface, android.graphics.Typeface.BOLD)
-                        setPadding(0, dp(18), 0, dp(2))
-                    })
-                    for (item in groupItems) {
-                        addRow(item)
-                    }
-                }
+                renderItems(items)
                 // Whole-scan total runs from the scan thread's
                 // start to the end of row building, so it includes
                 // the per-row local-state lookups accumulated in
@@ -344,6 +351,23 @@ class MainActivity : Activity() {
                 Timing.saveSummary(this@MainActivity, summary)
                 timingView.text = summary
                 maybeRunAuto()
+            }
+        }
+    }
+
+    /** Render rows grouped by project: one header per project,
+     *  every file of that project underneath it. Used for both the
+     *  persisted (stale) rows and the fresh scan's rows. */
+    private fun renderItems(items: List<ApkItem>) {
+        for ((project, groupItems) in items.groupBy { it.project }) {
+            itemsContainer.addView(TextView(this).apply {
+                text = project
+                textSize = 18f
+                setTypeface(typeface, android.graphics.Typeface.BOLD)
+                setPadding(0, dp(18), 0, dp(2))
+            })
+            for (item in groupItems) {
+                addRow(item)
             }
         }
     }
@@ -370,7 +394,7 @@ class MainActivity : Activity() {
             u.buildId?.let { parts.add("build $it") }
             parts.add(if (u.sha256 != null) "sha256 あり" else "sha256 なし")
             block.addView(TextView(this).apply {
-                text = "update.json: ${parts.joinToString(" / ")}"
+                text = "最新版: ${parts.joinToString(" / ")}"
                 textSize = 13f
             })
         }
@@ -382,7 +406,14 @@ class MainActivity : Activity() {
                 if (info == null) {
                     "インストール済み: なし（$knownPackage）"
                 } else {
-                    "インストール済み: ${info.versionName} (code ${info.longVersionCode})"
+                    // Update judgement by versionName tuple (the
+                    // scan knows no versionCodes since v0.2.0 —
+                    // see Store.isUpdateAvailable). Unparseable
+                    // names make no judgement, as before.
+                    val updateMark = if (
+                        Store.isUpdateAvailable(item.update?.versionName, info.versionName) == true
+                    ) "・更新あり" else ""
+                    "インストール済み: ${info.versionName} (code ${info.longVersionCode})$updateMark"
                 }
             }
         }
@@ -406,8 +437,8 @@ class MainActivity : Activity() {
         val installButton = Button(this).apply {
             text = "インストール"
             // Enabled when a downloaded file exists and, where its
-            // hash was recorded, it still matches what update.json
-            // currently offers. The install action re-hashes the
+            // hash was recorded, it still matches what the current
+            // release offers. The install action re-hashes the
             // file itself, so this is only the visual gate.
             val expectedSha = item.update?.sha256
             val recordedSha = timedLocal { Store.downloadedSha(this@MainActivity, item.fileName) }
@@ -513,17 +544,18 @@ class MainActivity : Activity() {
         setRowStatus(row, "インストール中: ${item.fileName}")
         thread(name = "install-${item.fileName}", isDaemon = true) {
             try {
-                // Re-verify the stored file against update.json at
-                // install time: whatever sits in internal storage is
-                // what gets installed, so it must still be the
-                // artifact the current update.json describes.
+                // Re-verify the stored file against the current
+                // release's digest at install time: whatever sits
+                // in internal storage is what gets installed, so it
+                // must still be the artifact the current release
+                // describes.
                 val expected = item.update?.sha256
                 if (expected != null) {
                     val actual = Store.sha256Of(Store.downloadedFile(this, item.fileName))
                     if (!expected.equals(actual, ignoreCase = true)) {
                         setRowStatus(
                             row,
-                            "保存済みファイルの SHA-256 が現在の update.json と一致しないためインストールしません。期待 ${expected.take(12)}… / 実際 ${actual.take(12)}…（再ダウンロードしてください）"
+                            "保存済みファイルの SHA-256 が現在のリリースと一致しないためインストールしません。期待 ${expected.take(12)}… / 実際 ${actual.take(12)}…（再ダウンロードしてください）"
                         )
                         return@thread
                     }

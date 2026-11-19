@@ -9,6 +9,7 @@ import android.content.pm.PackageInstaller
 import android.content.pm.PackageManager
 import android.os.Build
 import android.provider.MediaStore
+import org.json.JSONArray
 import org.json.JSONObject
 import java.io.File
 import java.io.InputStream
@@ -20,9 +21,10 @@ import java.security.MessageDigest
  * source since v0.2.0; the Drive/SAF source was removed).
  *
  * Items carry a [downloadUrl] and the release asset's own SHA-256
- * [assetDigest] as reported by the GitHub API, so the download is
- * verified against two independent statements of the hash:
- * update.json and the asset record. */
+ * [assetDigest] as reported by the GitHub API; [update] holds the
+ * release metadata synthesized from the release record (version
+ * name from the tag, the digest as its sha256 — see GitHubSource),
+ * so the download is verified against the asset record's hash. */
 data class ApkItem(
     val project: String,
     val fileName: String,
@@ -131,22 +133,118 @@ object Store {
     fun downloadedFile(context: Context, fileName: String): File =
         File(File(context.filesDir, "downloads").apply { mkdirs() }, fileName)
 
-    // -- update.json --------------------------------------------------------
+    // -- version tuples -----------------------------------------------------
+    //
+    // Update judgement (v0.2.0) compares version NAMES, not
+    // versionCodes: the scan no longer downloads update.json, so
+    // the latest versionCode is unknown, while the tag gives the
+    // latest versionName and PackageManager gives the installed
+    // one. All watched projects publish monotonic X.Y.Z names, so
+    // ordering by name tuple is sound.
 
-    internal fun parseUpdate(text: String): UpdateInfo? =
-        try {
-            val j = JSONObject(text)
-            UpdateInfo(
-                file = j.optString("file", ""),
-                buildId = if (j.has("buildId")) j.optLong("buildId") else null,
-                versionName = j.optString("versionName", "").ifEmpty { null },
-                versionCode = if (j.has("versionCode")) j.optLong("versionCode") else null,
-                sha256 = j.optString("sha256", "").ifEmpty { null }?.lowercase(),
-                size = if (j.has("size")) j.optLong("size") else null
-            )
-        } catch (e: Exception) {
-            null
+    /** "0.1" -> [0, 1, 0]; null when the name is missing or any
+     *  part is non-numeric (the caller then makes no update
+     *  judgement for that row, like the old digest-only rows). */
+    fun versionTuple(name: String?): List<Long>? {
+        if (name.isNullOrBlank()) return null
+        val out = mutableListOf<Long>()
+        for (part in name.trim().split('.')) {
+            out.add(part.toLongOrNull() ?: return null)
         }
+        while (out.size < 3) out.add(0L)
+        return out
+    }
+
+    /** True when [latestName] is strictly newer than
+     *  [installedName]; false when equal or older; null when
+     *  either name is unparseable (no judgement). */
+    fun isUpdateAvailable(latestName: String?, installedName: String?): Boolean? {
+        val latest = versionTuple(latestName) ?: return null
+        val installed = versionTuple(installedName) ?: return null
+        val n = maxOf(latest.size, installed.size)
+        for (i in 0 until n) {
+            val l = latest.getOrElse(i) { 0L }
+            val v = installed.getOrElse(i) { 0L }
+            if (l != v) return l > v
+        }
+        return false
+    }
+
+    // -- last-scan rows (stale-while-revalidate) -----------------------------
+    //
+    // The last completed scan's rows, persisted as JSON in
+    // filesDir, so the next open (or refresh) can render them
+    // immediately and replace them when the fresh scan lands.
+    // Only the fields needed to render a row and start a download
+    // are kept. Downloads started from a stale row stay safe: the
+    // bytes are verified against the release asset's digest after
+    // download (see download()).
+
+    private const val LAST_SCAN_FILE = "last-scan.json"
+
+    fun saveLastScan(context: Context, items: List<ApkItem>) {
+        try {
+            val arr = JSONArray()
+            for (item in items) {
+                arr.put(
+                    JSONObject()
+                        .put("project", item.project)
+                        .put("fileName", item.fileName)
+                        .put("size", item.size)
+                        .put("modified", item.modified)
+                        .put("versionName", item.update?.versionName ?: JSONObject.NULL)
+                        .put("downloadUrl", item.downloadUrl ?: JSONObject.NULL)
+                        .put("assetDigest", item.assetDigest ?: JSONObject.NULL)
+                        .put("source", item.source)
+                )
+            }
+            File(context.filesDir, LAST_SCAN_FILE).writeText(arr.toString())
+        } catch (e: Exception) {
+            // The cache is best-effort: losing it only costs the
+            // instant first render, never correctness.
+        }
+    }
+
+    fun loadLastScan(context: Context): List<ApkItem> {
+        return try {
+            val file = File(context.filesDir, LAST_SCAN_FILE)
+            if (!file.exists()) return emptyList()
+            val arr = JSONArray(file.readText())
+            val out = mutableListOf<ApkItem>()
+            for (i in 0 until arr.length()) {
+                val o = arr.optJSONObject(i) ?: continue
+                val fileName = o.optString("fileName")
+                if (fileName.isEmpty()) continue
+                val digest = if (o.isNull("assetDigest")) null
+                    else o.optString("assetDigest").ifEmpty { null }
+                val size = o.optLong("size", -1L)
+                out.add(
+                    ApkItem(
+                        project = o.optString("project"),
+                        fileName = fileName,
+                        size = size,
+                        modified = o.optLong("modified", 0L),
+                        update = UpdateInfo(
+                            file = fileName,
+                            buildId = null,
+                            versionName = if (o.isNull("versionName")) null
+                                else o.optString("versionName").ifEmpty { null },
+                            versionCode = null,
+                            sha256 = digest,
+                            size = if (size > 0) size else null
+                        ),
+                        source = o.optString("source").ifEmpty { "GitHub" },
+                        downloadUrl = if (o.isNull("downloadUrl")) null
+                            else o.optString("downloadUrl").ifEmpty { null },
+                        assetDigest = digest
+                    )
+                )
+            }
+            out
+        } catch (e: Exception) {
+            emptyList()
+        }
+    }
 
     // -- item streams ---------------------------------------------------
     //
@@ -203,8 +301,9 @@ object Store {
 
     data class DownloadResult(val file: File, val sha256: String, val bytes: Long)
 
-    /** The bytes the provider streamed do not match update.json.
-     *  Carries what actually arrived so the UI can name it. */
+    /** The streamed bytes do not match the release asset's
+     *  SHA-256 digest. Carries what actually arrived so the UI can
+     *  name it. */
     class ShaMismatchException(
         val expected: String,
         val actual: String,
@@ -235,8 +334,9 @@ object Store {
      * MediaStore so that `adb shell pm install` can install exactly
      * this file without any further transfer.
      *
-     * When update.json carries a SHA-256 and the streamed bytes do
-     * not match it, the downloaded file is deleted again and
+     * When the release record carries a SHA-256 digest and the
+     * streamed bytes do not match it, the downloaded file is
+     * deleted again and
      * [ShaMismatchException] is thrown: a mismatched file must never
      * stay behind in installable form. (Lesson carried over from
      * the Drive era: a stale file left in place after a reported
@@ -266,9 +366,11 @@ object Store {
             tmp.delete()
         }
         val sha = digest.digest().joinToString("") { "%02x".format(it) }
-        // Two independent expectations can apply: update.json's
-        // sha256, and the release asset's own digest from the
-        // GitHub API. Either one disagreeing is a mismatch.
+        // The expectation is the release asset's digest from the
+        // GitHub API; it is carried both as the item's assetDigest
+        // and as its update.sha256 (synthesized from the same
+        // record), and either statement disagreeing with the
+        // streamed bytes is a mismatch.
         val expected = item.update?.sha256 ?: item.assetDigest
         val assetExpected = item.assetDigest
         val mismatchExpected = when {
@@ -318,7 +420,7 @@ object Store {
                 "ダウンロード完了・SHA-256 一致$archiveText\n" +
                     "adb: $DOWNLOADS_ABS_DIR/${item.fileName}"
             } else {
-                "ダウンロード完了（update.json に sha256 が無いため未照合）$archiveText\n" +
+                "ダウンロード完了（照合用の sha256 が無いため未照合）$archiveText\n" +
                     "adb: $DOWNLOADS_ABS_DIR/${item.fileName}"
             }
         } catch (e: ShaMismatchException) {

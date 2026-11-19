@@ -34,28 +34,34 @@ map remains as the fallback when discovery itself fails.
 Selection does not use `/releases/latest` (an unrelated AAR-cache
 release holds that slot in the moka-vpn repository); only tags of
 the form `vX.Y.Z` qualify, and the highest such tag carrying the
-file wins. Downloads are verified against both `update.json`'s
-SHA-256 (when the release carries one naming that file) and the
-release asset's own `digest` from the GitHub API.
+file wins. Downloads are verified against the release asset's
+own `digest` from the GitHub API. The scan never downloads the
+`update.json` asset (it is still published with each release for
+other tooling): the latest version name comes from the tag, and
+update judgement compares version-name tuples against the
+installed app's version name (see "Scan speed").
 
 ### Scan speed (v0.2.0)
 
 On-device measurements (2026-11-19, timing-test builds) showed the
 GitHub phase was ~90% of an 8.2 s scan when repositories were
 fetched one after another. v0.2.0 therefore fetches repositories
-concurrently (bounded pool of 4, results joined in discovery
-order), starts optimistically from the repository list persisted
-by the previous successful discovery (those fetches run while
-discovery is still in flight; discovery remains authoritative),
-and sends `Cache-Control: no-cache` on API requests so a refresh
-always reads the current state. On top of that, publishers embed
-the `update.json` content in the release body (a line containing
-only `<!-- update-json -->`, followed by a fenced ```json block);
-when the chosen release carries that block the app parses the
-metadata from the body and never fetches the `update.json` asset
-(a VM benchmark put the repos phase at a 3,427 ms median with
-those fetches vs 930 ms releases-only). Releases without the
-marker still fetch the asset. The header keeps the last scan's timing summary
+concurrently (bounded pool of 8 — every watched repository in a
+single wave — results joined in discovery order), starts
+optimistically from the repository list persisted by the previous
+successful discovery (those fetches run while discovery is still
+in flight; discovery remains authoritative), and sends
+`Cache-Control: no-cache` on API requests so a refresh always
+reads the current state. The scan also performs no `update.json`
+requests at all: a VM benchmark put the repos phase at a
+3,427 ms median with per-file `update.json` fetches vs 930 ms
+releases-only, and everything the scan needs (latest version
+name, size, SHA-256 digest) is already in the releases record.
+Finally, the last completed scan's rows are persisted locally and
+rendered immediately on open and on refresh (stale-while-
+revalidate); the fresh scan replaces them when it lands, and
+downloads started from a stale row stay safe because the bytes
+are verified against the asset digest after download. The header keeps the last scan's timing summary
 (合計 / GitHub / ローカル) and every phase is logged to logcat
 under the `UpdaterTiming` tag.
 
@@ -83,13 +89,15 @@ file.
   every APK it publishes, with:
   - release asset size and update time,
   - the installed version (for known packages, and for any package
-    once its APK has been downloaded and parsed),
-  - `update.json` metadata when the release carries one naming
-    that file.
+    once its APK has been downloaded and parsed), with a
+    「・更新あり」 mark when the latest version-name tuple is
+    strictly newer than the installed one,
+  - the latest version name from the release tag and whether the
+    asset carries a SHA-256 digest.
 - 「ダウンロード」 downloads the APK into the app's internal
   downloads directory (the single APK storage location), verifies
-  SHA-256 when `update.json` provides one (a mismatch blocks the
-  install), and publishes the same bytes to
+  SHA-256 against the release asset's digest (a mismatch blocks
+  the install), and publishes the same bytes to
   `Download/apps-updater/<file>` on shared storage, plus a
   `<file>.done.json` marker (package, version, sha256, size).
 - 「インストール」 installs the downloaded copy with
@@ -124,7 +132,10 @@ through `/data/local/tmp` with an on-device copy first.
 
 ## update.json format
 
-Publishers attach an `update.json` asset to each release. All
+Publishers attach an `update.json` asset to each release. Since
+v0.2.0 the app itself no longer downloads it during scans (the
+releases record carries everything the scan needs); the file
+remains published for any other tooling that reads it. All
 fields except `file` are optional; phone-node's legacy
 `{"buildId": ..., "file": ...}` form is read as-is.
 
