@@ -65,6 +65,31 @@ are verified against the asset digest after download. The header keeps the last 
 (合計 / GitHub / ローカル) and every phase is logged to logcat
 under the `UpdaterTiming` tag.
 
+### Rate limits, optional token, failed scans (v0.2.2)
+
+The GitHub API is called unauthenticated by default, which
+allows 60 requests/hour **per IP address** — on a shared
+carrier-NAT address, other users burn the same quota (observed
+2026-11-19: the quota was exhausted twice in one evening and
+scans came back empty). The header's 「トークン設定」 button
+therefore accepts an optional personal GitHub token: it is
+stored only in the app's private preferences and sent only as
+the `Authorization` header of `api.github.com` requests (asset
+downloads and the package-probe ranges never receive it),
+raising the limit to 5,000 requests/hour for the token's own
+account. Each scan logs only the mode (`github auth token` /
+`github auth none`) under `UpdaterTiming`, never the value.
+
+A scan whose API requests fail records the failure (HTTP
+status, and the `X-RateLimit-Reset` time on 403/429). When such
+a scan comes back empty, the list is no longer wiped: the
+persisted rows stay on screen under a notice such as
+「更新に失敗しました（GitHub のレート制限、リセット 22:04）。前回の結果を表示しています。」,
+or, with no persisted scan yet, the failure message itself is
+shown instead of 「APK が見つかりませんでした」. A failed scan
+never overwrites the persisted last scan or the persisted
+repository list.
+
 ## Background downloads (v0.1.9)
 
 Downloads run in `DownloadService`, a foreground service with a

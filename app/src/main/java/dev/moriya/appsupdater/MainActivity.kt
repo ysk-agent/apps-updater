@@ -1,6 +1,7 @@
 package dev.moriya.appsupdater
 
 import android.app.Activity
+import android.app.AlertDialog
 import android.content.BroadcastReceiver
 import android.content.Context
 import android.content.Intent
@@ -9,10 +10,12 @@ import android.net.Uri
 import android.os.Build
 import android.os.Bundle
 import android.provider.Settings
+import android.text.InputType
 import android.view.Gravity
 import android.view.View
 import android.view.ViewGroup
 import android.widget.Button
+import android.widget.EditText
 import android.widget.LinearLayout
 import android.widget.ProgressBar
 import android.widget.ScrollView
@@ -117,6 +120,10 @@ class MainActivity : Activity() {
         buttons.addView(Button(this).apply {
             text = "インストール許可"
             setOnClickListener { openInstallPermissionSettings() }
+        })
+        buttons.addView(Button(this).apply {
+            text = "トークン設定"
+            setOnClickListener { showTokenDialog() }
         })
         root.addView(buttons)
 
@@ -267,6 +274,55 @@ class MainActivity : Activity() {
         }
     }
 
+    /**
+     * Optional GitHub token (v0.2.2). Without a token the GitHub
+     * API allows 60 requests/hour per IP address, which a shared
+     * carrier-NAT address can exhaust through no fault of the
+     * user; a personal token raises the limit to 5,000/hour for
+     * the token's own account. The token is stored only in the
+     * app's private preferences and sent only as the
+     * Authorization header to api.github.com (see GitHubSource).
+     */
+    private fun showTokenDialog() {
+        val input = EditText(this).apply {
+            inputType = InputType.TYPE_CLASS_TEXT or
+                InputType.TYPE_TEXT_VARIATION_PASSWORD or
+                InputType.TYPE_TEXT_FLAG_NO_SUGGESTIONS
+            setPadding(dp(16), dp(8), dp(16), dp(8))
+            val current = GitHubSource.token(this@MainActivity)
+            if (current != null) {
+                setText(current)
+                setSelection(text.length)
+            }
+        }
+        AlertDialog.Builder(this)
+            .setTitle("GitHub トークン")
+            .setMessage(
+                "任意です。設定すると GitHub API のレート制限が IP 単位の 60回/時から" +
+                    "トークンのアカウント単位の 5,000回/時に上がり、共有 IP でも制限に" +
+                    "当たりにくくなります。トークンはこの端末内にのみ保存され、" +
+                    "api.github.com への Authorization ヘッダーとしてのみ送信されます。"
+            )
+            .setView(input)
+            .setPositiveButton("保存") { _, _ ->
+                GitHubSource.setToken(this, input.text.toString())
+                val saved = GitHubSource.token(this) != null
+                Toast.makeText(
+                    this,
+                    if (saved) "トークンを保存しました" else "トークンを削除しました",
+                    Toast.LENGTH_SHORT
+                ).show()
+                refresh()
+            }
+            .setNeutralButton("クリア") { _, _ ->
+                GitHubSource.setToken(this, null)
+                Toast.makeText(this, "トークンを削除しました", Toast.LENGTH_SHORT).show()
+                refresh()
+            }
+            .setNegativeButton("キャンセル", null)
+            .show()
+    }
+
     private fun openInstallPermissionSettings() {
         try {
             startActivity(
@@ -312,12 +368,23 @@ class MainActivity : Activity() {
             // inside GitHubSource remains as the fallback for when
             // discovery itself fails (see GitHubSource.fetchAll).
             val githubStart = Timing.now()
+            var scanFailure: GitHubSource.ScanFailure? = null
             val githubItems = try {
-                GitHubSource.fetchAll(this)
+                val fetched = GitHubSource.fetchAll(this)
+                scanFailure = GitHubSource.lastScanFailure
+                fetched
             } catch (e: Exception) {
+                // fetchAll itself is not expected to throw (it
+                // guards its workers), but treat it as a transport
+                // failure rather than an empty result if it does.
+                scanFailure = GitHubSource.ScanFailure(null, null)
                 emptyList()
             }
+            val failure = scanFailure
             val githubMs = Timing.now() - githubStart
+            // A failed (empty) scan never overwrites the persisted
+            // last scan: saveLastScan runs only for a scan that
+            // actually produced rows.
             if (githubItems.isNotEmpty()) {
                 Store.saveLastScan(this, githubItems)
             }
@@ -330,13 +397,34 @@ class MainActivity : Activity() {
                 // its local-lookup accumulation starts here, not
                 // at the stale render above.
                 localStateMs = 0L
-                if (items.isEmpty()) {
-                    itemsContainer.addView(TextView(this).apply {
-                        text = "APK が見つかりませんでした。通信状態を確認して再読み込みしてください。"
-                        textSize = 14f
-                    })
+                when {
+                    items.isNotEmpty() -> renderItems(items)
+                    failure != null && persisted.isNotEmpty() -> {
+                        // Failed scan (v0.2.2): keep the previous
+                        // results on screen under a notice saying
+                        // the refresh failed, instead of wiping
+                        // them for the not-found line.
+                        itemsContainer.addView(TextView(this).apply {
+                            text = "更新に失敗しました（${GitHubSource.describeFailure(failure)}）。" +
+                                "前回の結果を表示しています。"
+                            textSize = 14f
+                        })
+                        renderItems(persisted)
+                    }
+                    failure != null -> {
+                        itemsContainer.addView(TextView(this).apply {
+                            text = "更新に失敗しました（${GitHubSource.describeFailure(failure)}）。" +
+                                "通信状態を確認して再読み込みしてください。"
+                            textSize = 14f
+                        })
+                    }
+                    else -> {
+                        itemsContainer.addView(TextView(this).apply {
+                            text = "APK が見つかりませんでした。通信状態を確認して再読み込みしてください。"
+                            textSize = 14f
+                        })
+                    }
                 }
-                renderItems(items)
                 // Whole-scan total runs from the scan thread's
                 // start to the end of row building, so it includes
                 // the per-row local-state lookups accumulated in

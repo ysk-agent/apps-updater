@@ -10,6 +10,7 @@ import java.util.concurrent.Callable
 import java.util.concurrent.ExecutorService
 import java.util.concurrent.Executors
 import java.util.concurrent.Future
+import java.util.concurrent.atomic.AtomicReference
 
 /**
  * GitHub Releases source — the ONLY source since v0.2.0 (the
@@ -85,9 +86,26 @@ import java.util.concurrent.Future
  * result is persisted. The probe fetches ranges of the APK asset
  * only — update.json stays out of the scan.
  *
- * All repositories are public; no token is used or needed. The
- * unauthenticated search API allows 10 requests/minute, far above
- * this app's user-triggered refresh rate.
+ * Optional token (v0.2.2): all repositories are public, so no
+ * token is needed to read them — but the unauthenticated API
+ * limit is 60 requests/hour PER IP, and on a shared carrier-NAT
+ * address other users burn the same quota: on 2026-11-19 the
+ * user's phone hit the limit twice in one evening and scans came
+ * back empty. The user can therefore paste a personal token in
+ * the header's トークン設定 dialog; it is stored only in this
+ * app's private preferences and sent only as the Authorization
+ * header of api.github.com requests (this file's [httpGetText]
+ * is the only place API requests are made — asset downloads in
+ * Store and the PackageProbe ranges never see it), raising the
+ * limit to 5,000 requests/hour for the token's own account. The
+ * token value is never logged; each scan logs only the mode
+ * ("github auth token" / "github auth none").
+ *
+ * Scan failure (v0.2.2): when an API request fails, the failure
+ * (HTTP status, and the rate-limit reset time on 403/429) is
+ * recorded in [lastScanFailure], so the UI can tell an empty
+ * result caused by a failure apart from a genuinely empty one
+ * and keep the previous scan's rows on screen (see MainActivity).
  */
 object GitHubSource {
 
@@ -150,6 +168,92 @@ object GitHubSource {
             .edit().putString(KEY_KNOWN_REPOS, repos.joinToString("\n")).apply()
     }
 
+    // -- optional user token (v0.2.2) --------------------------------
+
+    private const val KEY_AUTH_TOKEN = "auth_token"
+
+    /** The user-supplied GitHub token, or null when none is set.
+     *  Stored only in this app's private preferences; used solely
+     *  as the Authorization header of api.github.com requests. */
+    fun token(context: Context): String? =
+        context.applicationContext
+            .getSharedPreferences(PREFS, Context.MODE_PRIVATE)
+            .getString(KEY_AUTH_TOKEN, null)
+            ?.takeIf { it.isNotBlank() }
+
+    /** Save (or, for a null/blank value, clear) the token. */
+    fun setToken(context: Context, token: String?) {
+        val trimmed = token?.trim().orEmpty()
+        val edit = context.applicationContext
+            .getSharedPreferences(PREFS, Context.MODE_PRIVATE).edit()
+        if (trimmed.isEmpty()) {
+            edit.remove(KEY_AUTH_TOKEN)
+        } else {
+            edit.putString(KEY_AUTH_TOKEN, trimmed)
+        }
+        edit.apply()
+        authToken = trimmed.ifEmpty { null }
+    }
+
+    /** The token the current scan authenticates with, loaded from
+     *  preferences at the start of [fetchAll] (and kept in sync by
+     *  [setToken]). Read by [httpGetText] on pool threads. */
+    @Volatile
+    private var authToken: String? = null
+
+    // -- scan failure capture (v0.2.2) -------------------------------
+
+    /** One API failure of a scan: the HTTP status when a response
+     *  was received (null for a transport failure — unreachable,
+     *  timeout, refused), and, on 403/429, the value of the
+     *  X-RateLimit-Reset header (epoch seconds) when GitHub sent
+     *  one. */
+    data class ScanFailure(
+        val httpStatus: Int?,
+        val rateLimitResetEpochSec: Long?
+    )
+
+    /** The most informative failure recorded by the most recent
+     *  [fetchAll] scan, or null when no API request failed.
+     *  Written only by the thread that called fetchAll, from the
+     *  per-scan [scanFailureRef] the pool threads record into. */
+    @Volatile
+    var lastScanFailure: ScanFailure? = null
+        private set
+
+    private val scanFailureRef = AtomicReference<ScanFailure?>(null)
+
+    /** Record one failed API request of the running scan. A
+     *  failure carrying a rate-limit reset time is the most
+     *  actionable one (the UI can say when a retry will work), so
+     *  it replaces a plainer failure, never the reverse. */
+    private fun recordFailure(httpStatus: Int?, rateLimitResetEpochSec: Long?) {
+        val candidate = ScanFailure(httpStatus, rateLimitResetEpochSec)
+        scanFailureRef.updateAndGet { old ->
+            when {
+                old == null -> candidate
+                candidate.rateLimitResetEpochSec != null -> candidate
+                else -> old
+            }
+        }
+    }
+
+    /** Japanese one-line description of a scan failure for the
+     *  UI, e.g. "GitHub のレート制限、リセット 22:04" or
+     *  "通信エラー". The reset time is the rate-limit reset,
+     *  formatted in local time. */
+    fun describeFailure(failure: ScanFailure): String {
+        val reason = when (failure.httpStatus) {
+            403, 429 -> "GitHub のレート制限"
+            null -> "通信エラー"
+            else -> "HTTP ${failure.httpStatus}"
+        }
+        val reset = failure.rateLimitResetEpochSec ?: return reason
+        val time = java.text.SimpleDateFormat("HH:mm", java.util.Locale.getDefault())
+            .format(java.util.Date(reset * 1000))
+        return "$reason、リセット $time"
+    }
+
     // -- scan timing --------------------------------------------------
 
     /** Breakdown of the most recent [fetchAll] scan, written
@@ -186,9 +290,16 @@ object GitHubSource {
         val totalStart = Timing.now()
         val timings = ScanTimings()
         lastScanTimings = timings
-        // Per-scan cache: every scan starts from fresh release lists.
+        // Per-scan state: fresh release lists, no recorded failure
+        // yet, and the auth credential re-read from preferences
+        // (the token dialog may have changed it since the last
+        // scan). Only the MODE is logged — never the token value.
         synchronized(releasesCache) { releasesCache.clear() }
         synchronized(repoFetchLocks) { repoFetchLocks.clear() }
+        scanFailureRef.set(null)
+        lastScanFailure = null
+        authToken = token(context)
+        Timing.logLine(if (authToken != null) "github auth token" else "github auth none")
 
         val pool = Executors.newFixedThreadPool(8)
         try {
@@ -208,7 +319,6 @@ object GitHubSource {
 
             val result: List<ApkItem> = when {
                 !discovered.isNullOrEmpty() -> {
-                    saveKnownRepos(context, discovered)
                     val futures = LinkedHashMap<String, Future<List<ApkItem>>>()
                     for (repo in discovered) {
                         futures[repo] = optimistic.remove(repo) ?: submitRepo(pool, repo)
@@ -217,7 +327,15 @@ object GitHubSource {
                     // repositories discovery no longer returns:
                     // their results are discarded by never joining
                     // those futures.
-                    joinInOrder(futures)
+                    val joined = joinInOrder(futures)
+                    // A failed scan must not overwrite the
+                    // persisted repository list: discovery's answer
+                    // is only persisted when the scan as a whole
+                    // produced rows, or nothing actually failed.
+                    if (joined.isNotEmpty() || scanFailureRef.get() == null) {
+                        saveKnownRepos(context, discovered)
+                    }
+                    joined
                 }
                 known.isNotEmpty() -> joinInOrder(optimistic)
                 else -> FILE_REPO.keys.mapNotNull { fileName ->
@@ -235,6 +353,7 @@ object GitHubSource {
             // so the rows the caller renders already know their
             // installed version and update judgement.
             learnUnknownPackages(context, result, pool)
+            lastScanFailure = scanFailureRef.get()
             timings.totalMs = Timing.now() - totalStart
             Timing.log("github total", timings.totalMs!!)
             return result
@@ -500,10 +619,14 @@ object GitHubSource {
     }
 
     /** Small text GET for API payloads (discovery + release
-     *  lists). Asset bytes do NOT go through here — Store streams
-     *  those with progress and hashing. Returns null on any
-     *  failure: GitHub being unreachable must never break the
-     *  listing. Cache-Control: no-cache makes every refresh read
+     *  lists) — the ONLY place api.github.com requests are made.
+     *  Asset bytes do NOT go through here — Store streams those
+     *  with progress and hashing, and PackageProbe ranges the
+     *  asset hosts; neither ever receives the token. Returns null
+     *  on any failure: GitHub being unreachable must never break
+     *  the listing. Every failure is recorded (see
+     *  [recordFailure]) so the scan can report WHY it came back
+     *  empty. Cache-Control: no-cache makes every refresh read
      *  the current state instead of an HTTP-cached response
      *  (v0.2.0). */
     private fun httpGetText(url: String): String? {
@@ -515,10 +638,26 @@ object GitHubSource {
                 setRequestProperty("Accept", "application/vnd.github+json")
                 setRequestProperty("User-Agent", "AppsUpdater")
                 setRequestProperty("Cache-Control", "no-cache")
+                // Optional user token (v0.2.2): sent ONLY to
+                // api.github.com, as the Authorization header.
+                val token = authToken
+                if (token != null && URL(url).host == "api.github.com") {
+                    setRequestProperty("Authorization", "Bearer $token")
+                }
             }
-            if (conn.responseCode !in 200..299) return null
+            val code = conn.responseCode
+            if (code !in 200..299) {
+                val reset = if (code == 403 || code == 429) {
+                    conn.getHeaderField("X-RateLimit-Reset")?.toLongOrNull()
+                } else {
+                    null
+                }
+                recordFailure(code, reset)
+                return null
+            }
             conn.inputStream.bufferedReader().use { it.readText() }
         } catch (e: Exception) {
+            recordFailure(null, null)
             null
         } finally {
             conn?.disconnect()

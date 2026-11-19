@@ -73,6 +73,17 @@ else
   note_fail "package probe did not learn findmy-mac/yt-client packages (see probe-logcat.txt)"
 fi
 
+# Auth mode (v0.2.2): every scan logs exactly one
+# "github auth token" / "github auth none" line under
+# UpdaterTiming. CI sets no token, so "none" must appear (and the
+# token value can never appear — there is none, and the app logs
+# only the mode).
+if grep -q "github auth none" probe-logcat.txt; then
+  echo "OK: scan logged its auth mode (github auth none — no token configured in CI)"
+else
+  note_fail "scan did not log an auth mode line (see probe-logcat.txt)"
+fi
+
 screencap screenshot-main-light.png
 
 # Moriya's phones run in dark mode; capture the rest in dark mode.
@@ -174,6 +185,51 @@ else
   note_fail "no status recorded for the mismatched download"
 fi
 kill $HTTP_PID 2>/dev/null || true
+
+# --- Failed-scan resilience (v0.2.2) ------------------------------
+# A scan whose API requests fail (rate limit, network down) must
+# keep the persisted rows on screen under a failure notice instead
+# of wiping the list. Exercise the real path: point api.github.com
+# at 127.0.0.1 in the emulator's hosts file so every API request
+# is refused, relaunch (onNewIntent re-runs the scan), and inspect
+# the UI. The scans above have already populated the persisted
+# last scan, which is what must survive. Best-effort: if the hosts
+# edit does not take effect in this emulator image (verified via
+# ping), the section skips with a note instead of failing.
+adb root >/dev/null 2>&1 || true
+sleep 1
+adb remount >/dev/null 2>&1 || true
+adb shell "cp /etc/hosts /sdcard/hosts.bak" >/dev/null 2>&1 || true
+adb shell "echo '127.0.0.1 api.github.com' >> /etc/hosts" >/dev/null 2>&1 || true
+BLOCKED=0
+if adb shell ping -c 1 -W 2 api.github.com 2>/dev/null | head -1 | grep -q "127.0.0.1"; then
+  BLOCKED=1
+fi
+if [ "$BLOCKED" = 1 ]; then
+  adb shell am start -n $PKG/.MainActivity >/dev/null 2>&1
+  sleep 10
+  adb shell uiautomator dump /sdcard/window_dump_fail.xml >/dev/null 2>&1 || true
+  adb pull /sdcard/window_dump_fail.xml window_dump_fail.xml >/dev/null 2>&1 || true
+  if grep -q "更新に失敗しました" window_dump_fail.xml && \
+     grep -q "前回の結果を表示しています" window_dump_fail.xml; then
+    echo "OK: failed scan showed the failure notice"
+  else
+    note_fail "failed scan did not show the failure notice (see window_dump_fail.xml)"
+  fi
+  if grep -q "apps-updater.apk" window_dump_fail.xml; then
+    echo "OK: persisted rows still rendered after the failed scan"
+  else
+    note_fail "persisted rows vanished after the failed scan (see window_dump_fail.xml)"
+  fi
+  screencap screenshot-failed-scan.png
+else
+  echo "NOTE: could not block api.github.com via /etc/hosts in this emulator; failure-path UI check skipped"
+fi
+adb shell "cp /sdcard/hosts.bak /etc/hosts" >/dev/null 2>&1 || true
+# Relaunch so the app re-scans with the API reachable again and
+# the sections below see the normal list.
+adb shell am start -n $PKG/.MainActivity >/dev/null 2>&1
+sleep 5
 
 # Scrolled screenshot (v0.2.1): bring the last projects' rows into
 # view so the learned-package rows (yt-client) can be inspected

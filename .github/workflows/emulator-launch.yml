@@ -74,10 +74,12 @@ jobs:
             probe-logcat.txt
             dumpsys-activities.txt
             window_dump.xml
+            window_dump_fail.xml
             screenshot-main.png
             screenshot-main-light.png
             screenshot-auto.png
             screenshot-scrolled.png
+            screenshot-failed-scan.png
           if-no-files-found: warn
 
       - name: Upload APK
