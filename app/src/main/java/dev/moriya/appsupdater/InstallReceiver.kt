@@ -26,7 +26,7 @@ class InstallReceiver : BroadcastReceiver() {
         val message = intent.getStringExtra(PackageInstaller.EXTRA_STATUS_MESSAGE) ?: ""
         val file = intent.getStringExtra(Store.EXTRA_FILE) ?: "(unknown)"
         // Key the status to the artifact that was just installed, so
-        // it stops being shown once Drive offers a newer one.
+        // it stops being shown once a newer release is offered.
         val versionKey = try {
             Store.archiveInfo(context, Store.downloadedFile(context, file))
                 ?.longVersionCode?.toString()

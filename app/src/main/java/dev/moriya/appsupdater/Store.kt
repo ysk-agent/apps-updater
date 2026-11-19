@@ -7,9 +7,7 @@ import android.content.Intent
 import android.content.pm.PackageInfo
 import android.content.pm.PackageInstaller
 import android.content.pm.PackageManager
-import android.net.Uri
 import android.os.Build
-import android.provider.DocumentsContract
 import android.provider.MediaStore
 import org.json.JSONObject
 import java.io.File
@@ -18,22 +16,20 @@ import java.net.HttpURLConnection
 import java.net.URL
 import java.security.MessageDigest
 
-/** One APK offered by one of the sources.
+/** One APK offered by the GitHub Releases source (the only
+ * source since v0.2.0; the Drive/SAF source was removed).
  *
- * Drive items carry a [docUri] into the SAF tree. GitHub Releases
- * items (piloted on moka-vpn in v0.1.8, generalised in v0.1.9)
- * carry a [downloadUrl] and the release asset's own SHA-256 [assetDigest]
- * as reported by the GitHub API, so the download is verified
- * against two independent statements of the hash: update.json and
- * the asset record. */
+ * Items carry a [downloadUrl] and the release asset's own SHA-256
+ * [assetDigest] as reported by the GitHub API, so the download is
+ * verified against two independent statements of the hash:
+ * update.json and the asset record. */
 data class ApkItem(
     val project: String,
     val fileName: String,
-    val docUri: Uri?,
     val size: Long,
     val modified: Long,
     val update: UpdateInfo?,
-    val source: String = "Drive",
+    val source: String = "GitHub",
     val downloadUrl: String? = null,
     val assetDigest: String? = null
 )
@@ -55,7 +51,6 @@ object AppState {
 
 object Store {
     private const val PREFS = "appsupdater-prefs"
-    private const val KEY_TREE_URI = "tree_uri"
     private const val KEY_STATUS_PREFIX = "status_"
     private const val KEY_STATUS_VER_PREFIX = "statusver_"
     private const val KEY_SHA_PREFIX = "sha_"
@@ -76,15 +71,6 @@ object Store {
     )
 
     // -- prefs ------------------------------------------------------------
-
-    fun setTreeUri(context: Context, uri: Uri) {
-        context.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
-            .edit().putString(KEY_TREE_URI, uri.toString()).apply()
-    }
-
-    fun treeUri(context: Context): Uri? =
-        context.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
-            .getString(KEY_TREE_URI, null)?.let { Uri.parse(it) }
 
     /**
      * Persist a per-file status together with the key of the
@@ -145,42 +131,7 @@ object Store {
     fun downloadedFile(context: Context, fileName: String): File =
         File(File(context.filesDir, "downloads").apply { mkdirs() }, fileName)
 
-    // -- SAF scan -----------------------------------------------------------
-
-    private data class Child(val docId: String, val name: String, val mime: String, val size: Long, val modified: Long)
-
-    private fun listChildren(context: Context, tree: Uri, parentDocId: String): List<Child> {
-        val childrenUri = DocumentsContract.buildChildDocumentsUriUsingTree(tree, parentDocId)
-        val projection = arrayOf(
-            DocumentsContract.Document.COLUMN_DOCUMENT_ID,
-            DocumentsContract.Document.COLUMN_DISPLAY_NAME,
-            DocumentsContract.Document.COLUMN_MIME_TYPE,
-            DocumentsContract.Document.COLUMN_SIZE,
-            DocumentsContract.Document.COLUMN_LAST_MODIFIED
-        )
-        val out = mutableListOf<Child>()
-        context.contentResolver.query(childrenUri, projection, null, null, null)?.use { c ->
-            while (c.moveToNext()) {
-                out.add(
-                    Child(
-                        docId = c.getString(0) ?: continue,
-                        name = c.getString(1) ?: continue,
-                        mime = c.getString(2) ?: "",
-                        size = if (c.isNull(3)) -1L else c.getLong(3),
-                        modified = if (c.isNull(4)) -1L else c.getLong(4)
-                    )
-                )
-            }
-        }
-        return out
-    }
-
-    private fun readText(context: Context, docUri: Uri): String? =
-        try {
-            context.contentResolver.openInputStream(docUri)?.bufferedReader()?.use { it.readText() }
-        } catch (e: Exception) {
-            null
-        }
+    // -- update.json --------------------------------------------------------
 
     internal fun parseUpdate(text: String): UpdateInfo? =
         try {
@@ -197,77 +148,14 @@ object Store {
             null
         }
 
-    /** Scan the granted tree: one level of project folders, APKs inside. */
-    fun scan(context: Context): List<ApkItem> {
-        val tree = treeUri(context) ?: return emptyList()
-        val rootId = DocumentsContract.getTreeDocumentId(tree)
-        val items = mutableListOf<ApkItem>()
-        for (child in listChildren(context, tree, rootId)) {
-            if (child.mime == DocumentsContract.Document.MIME_TYPE_DIR) {
-                val updateByFile = mutableMapOf<String, UpdateInfo>()
-                val apks = mutableListOf<Child>()
-                for (grand in listChildren(context, tree, child.docId)) {
-                    when {
-                        grand.name.endsWith(".apk", ignoreCase = true) -> apks.add(grand)
-                        grand.name == "update.json" -> {
-                            val docUri = DocumentsContract.buildDocumentUriUsingTree(tree, grand.docId)
-                            readText(context, docUri)?.let { parseUpdate(it) }?.let { info ->
-                                if (info.file.isNotEmpty()) updateByFile[info.file] = info
-                            }
-                        }
-                    }
-                }
-                for (apk in apks) {
-                    items.add(
-                        ApkItem(
-                            project = child.name,
-                            fileName = apk.name,
-                            docUri = DocumentsContract.buildDocumentUriUsingTree(tree, apk.docId),
-                            size = apk.size,
-                            modified = apk.modified,
-                            update = updateByFile[apk.name]
-                        )
-                    )
-                }
-            } else if (child.name.endsWith(".apk", ignoreCase = true)) {
-                items.add(
-                    ApkItem(
-                        project = "(apps 直下)",
-                        fileName = child.name,
-                        docUri = DocumentsContract.buildDocumentUriUsingTree(tree, child.docId),
-                        size = child.size,
-                        modified = child.modified,
-                        update = null
-                    )
-                )
-            }
-        }
-        // The Drive provider can surface the same document more than
-        // once (observed on a real device: the same app appearing in
-        // separated, duplicated rows). File names are unique per app
-        // in this tree, so collapse duplicates by file name, keeping
-        // the most recently modified copy.
-        val deduped = items
-            .groupBy { it.fileName.lowercase() }
-            .values
-            .map { group -> group.maxByOrNull { it.modified } ?: group.first() }
-        return deduped.sortedWith(compareBy({ it.project }, { it.fileName }))
-    }
-
     // -- item streams ---------------------------------------------------
     //
-    // Producing GitHub-sourced rows lives in GitHubSource (it was
-    // an in-Store moka-vpn-only pilot in v0.1.8). What stays here is
-    // the byte path shared by both sources:
+    // Producing the rows lives in GitHubSource. What stays here is
+    // the byte path: an HTTPS stream of the release asset.
 
-    /** Stream for one item: HTTPS for GitHub items, the SAF
-     *  document for Drive items. */
+    /** Stream for one item: the release asset over HTTPS. */
     private fun openItemStream(context: Context, item: ApkItem): InputStream? {
-        val url = item.downloadUrl
-        if (url == null) {
-            val doc = item.docUri ?: return null
-            return context.contentResolver.openInputStream(doc)
-        }
+        val url = item.downloadUrl ?: return null
         val conn = (URL(url).openConnection() as HttpURLConnection).apply {
             requestMethod = "GET"
             connectTimeout = 15_000
@@ -283,17 +171,6 @@ object Store {
             throw IllegalStateException("GitHub から取得できませんでした (HTTP $code)")
         }
         return conn.inputStream
-    }
-
-    /** Display name of the granted root folder, if resolvable. */
-    fun rootName(context: Context): String? {
-        val tree = treeUri(context) ?: return null
-        return try {
-            context.contentResolver.query(tree, arrayOf(DocumentsContract.Document.COLUMN_DISPLAY_NAME), null, null, null)
-                ?.use { c -> if (c.moveToFirst()) c.getString(0) else null }
-        } catch (e: Exception) {
-            null
-        }
     }
 
     // -- package info -------------------------------------------------------
@@ -351,18 +228,19 @@ object Store {
     }
 
     /**
-     * Copy the SAF document into internal storage, computing SHA-256 on
-     * the way, then publish the same bytes into the public Downloads
-     * folder via MediaStore so that `adb shell pm install` can install
-     * exactly this file without any further transfer.
+     * Stream the release asset into internal storage (the app's
+     * dedicated downloads directory — the single APK storage
+     * location since v0.2.0), computing SHA-256 on the way, then
+     * publish the same bytes into the public Downloads folder via
+     * MediaStore so that `adb shell pm install` can install exactly
+     * this file without any further transfer.
      *
-     * When update.json carries a SHA-256 and the streamed bytes do not
-     * match it, the downloaded file is deleted again and
+     * When update.json carries a SHA-256 and the streamed bytes do
+     * not match it, the downloaded file is deleted again and
      * [ShaMismatchException] is thrown: a mismatched file must never
-     * stay behind in installable form. (Observed on a real device:
-     * the Drive provider streamed a stale cached revision, the
-     * mismatch was reported — and after a refresh the still-present
-     * stale file could be installed as if it were the update.)
+     * stay behind in installable form. (Lesson carried over from
+     * the Drive era: a stale file left in place after a reported
+     * mismatch could later be installed as if it were the update.)
      */
     fun download(context: Context, item: ApkItem, onProgress: (Long, Long) -> Unit): DownloadResult {
         val target = downloadedFile(context, item.fileName)
@@ -389,8 +267,8 @@ object Store {
         }
         val sha = digest.digest().joinToString("") { "%02x".format(it) }
         // Two independent expectations can apply: update.json's
-        // sha256, and (GitHub items) the release asset's own digest
-        // from the GitHub API. Either one disagreeing is a mismatch.
+        // sha256, and the release asset's own digest from the
+        // GitHub API. Either one disagreeing is a mismatch.
         val expected = item.update?.sha256 ?: item.assetDigest
         val assetExpected = item.assetDigest
         val mismatchExpected = when {
@@ -444,11 +322,10 @@ object Store {
                     "adb: $DOWNLOADS_ABS_DIR/${item.fileName}"
             }
         } catch (e: ShaMismatchException) {
-            // Name what actually arrived: when the Drive provider
-            // serves a stale generation, the archive identity makes
-            // that visible instead of a bare "mismatch". The
-            // mismatched file itself was already deleted by
-            // download(), so it cannot be installed later.
+            // Name what actually arrived: the archive identity makes
+            // a wrong-bytes download visible instead of a bare
+            // "mismatch". The mismatched file itself was already
+            // deleted by download(), so it cannot be installed later.
             val sb = StringBuilder(
                 "SHA-256 不一致のため破棄しました。期待 ${e.expected.take(12)}… / 実際 ${e.actual.take(12)}…"
             )
@@ -458,12 +335,6 @@ object Store {
             val expSize = item.update?.size
             if (expSize != null && expSize != e.bytes) {
                 sb.append("\nサイズも不一致: 期待 $expSize / 実際 ${e.bytes}")
-            }
-            val expCode = item.update?.versionCode
-            if (item.source == "Drive" && expCode != null &&
-                e.archiveVersionCode != null && e.archiveVersionCode < expCode
-            ) {
-                sb.append("\n端末側の Drive プロバイダが古い世代の実体を返した可能性があります。")
             }
             sb.toString()
         } catch (e: Exception) {

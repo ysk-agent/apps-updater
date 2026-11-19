@@ -24,16 +24,18 @@ import java.util.Locale
 import kotlin.concurrent.thread
 
 /**
- * Apps Updater: lists the APKs published in the Drive `apps` folder
- * (granted once via SAF), shows the installed version next to each,
- * and downloads / installs on demand.
+ * Apps Updater: lists the APKs published as GitHub Releases by the
+ * watched repositories (discovered via the `android` topic — see
+ * GitHubSource; the only source since v0.2.0, the Drive/SAF source
+ * was removed), shows the installed version next to each, and
+ * downloads / installs on demand. No folder grant is needed.
  *
- * Downloads land in two places: internal storage (used for the
- * in-app PackageInstaller flow) and the public
- * Download/apps-updater/ folder (so `adb shell pm install` can
- * finish an update silently, with no transfer over the adb link:
- * the file is already on the device, fetched at line speed through
- * the Drive app's provider).
+ * Downloads land in two places: the app's internal downloads
+ * directory (used for the in-app PackageInstaller flow) and the
+ * public Download/apps-updater/ folder (so `adb shell pm install`
+ * can finish an update silently, with no transfer over the adb
+ * link: the file is already on the device, fetched at line speed
+ * over HTTPS).
  *
  * Automation entry point (used by tools/adb_update.py):
  *   am start -n dev.moriya.appsupdater/.MainActivity \
@@ -42,10 +44,27 @@ import kotlin.concurrent.thread
  */
 class MainActivity : Activity() {
 
-    private lateinit var sourceView: TextView
     private lateinit var permView: TextView
+    private lateinit var timingView: TextView
     private lateinit var confirmButton: Button
     private lateinit var itemsContainer: LinearLayout
+
+    /** Accumulated ms spent in the per-row local-state lookups
+     *  (installed version, downloaded file / recorded SHA,
+     *  persisted status) during row building. Sub-millisecond calls
+     *  are accumulated with nanoTime and reported in ms; reset at
+     *  the start of every refresh. Part of the scan-timing summary
+     *  (see Timing). */
+    @Volatile private var localStateMs: Long = 0L
+
+    private fun <T> timedLocal(block: () -> T): T {
+        val start = System.nanoTime()
+        try {
+            return block()
+        } finally {
+            localStateMs += (System.nanoTime() - start) / 1_000_000
+        }
+    }
 
     private var autoProject: String? = null
     private var autoFile: String? = null
@@ -84,8 +103,6 @@ class MainActivity : Activity() {
             text = "version ${selfInfo?.versionName ?: "?"} (code ${selfInfo?.longVersionCode ?: "?"})"
             textSize = 13f
         })
-        sourceView = TextView(this).apply { textSize = 14f }
-        root.addView(sourceView)
         permView = TextView(this).apply { textSize = 13f }
         root.addView(permView)
 
@@ -93,10 +110,6 @@ class MainActivity : Activity() {
             orientation = LinearLayout.HORIZONTAL
             gravity = Gravity.START
         }
-        buttons.addView(Button(this).apply {
-            text = "フォルダを選ぶ"
-            setOnClickListener { launchPicker() }
-        })
         buttons.addView(Button(this).apply {
             text = "再読み込み"
             setOnClickListener { refresh() }
@@ -128,6 +141,14 @@ class MainActivity : Activity() {
             text = "ダウンロード先（adb 用）: ${Store.DOWNLOADS_ABS_DIR}/<ファイル名>"
             textSize = 12f
         })
+
+        // Last scan's phase summary, persisted by Timing so it
+        // survives process restarts.
+        timingView = TextView(this).apply {
+            text = Timing.lastSummary(this@MainActivity) ?: "前回スキャン: -"
+            textSize = 12f
+        }
+        root.addView(timingView)
 
         itemsContainer = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
         root.addView(itemsContainer)
@@ -174,6 +195,8 @@ class MainActivity : Activity() {
     override fun onResume() {
         super.onResume()
         updateHeader()
+        // Keep the persisted scan-timing summary visible.
+        Timing.lastSummary(this)?.let { timingView.text = it }
         // Reflect install outcomes recorded by InstallReceiver while
         // this activity was not in front, and download outcomes
         // recorded by DownloadService (a download may have finished
@@ -213,7 +236,6 @@ class MainActivity : Activity() {
         val item = ApkItem(
             project = "ci-test",
             fileName = file,
-            docUri = null,
             size = size,
             modified = 0L,
             update = UpdateInfo(
@@ -238,43 +260,10 @@ class MainActivity : Activity() {
     // -- header -------------------------------------------------------------
 
     private fun updateHeader() {
-        val tree = Store.treeUri(this)
-        sourceView.text = when {
-            tree == null -> "Drive フォルダ: 未設定（「フォルダを選ぶ」から apps フォルダを指定してください）"
-            else -> "Drive フォルダ: ${Store.rootName(this) ?: "apps（設定済み）"}"
-        }
         permView.text = if (packageManager.canRequestPackageInstalls()) {
             "不明なアプリのインストール: 許可済み"
         } else {
             "不明なアプリのインストール: 未許可（「インストール許可」から許可してください）"
-        }
-    }
-
-    private fun launchPicker() {
-        val intent = Intent(Intent.ACTION_OPEN_DOCUMENT_TREE).apply {
-            addFlags(
-                Intent.FLAG_GRANT_READ_URI_PERMISSION or
-                    Intent.FLAG_GRANT_PERSISTABLE_URI_PERMISSION
-            )
-        }
-        @Suppress("DEPRECATION")
-        startActivityForResult(intent, REQUEST_TREE)
-    }
-
-    @Deprecated("Legacy result API keeps the app dependency-free")
-    override fun onActivityResult(requestCode: Int, resultCode: Int, data: Intent?) {
-        super.onActivityResult(requestCode, resultCode, data)
-        if (requestCode == REQUEST_TREE && resultCode == RESULT_OK) {
-            val uri: Uri = data?.data ?: return
-            try {
-                contentResolver.takePersistableUriPermission(
-                    uri, Intent.FLAG_GRANT_READ_URI_PERMISSION
-                )
-            } catch (e: Exception) {
-                Toast.makeText(this, "フォルダの許可を保持できませんでした", Toast.LENGTH_LONG).show()
-            }
-            Store.setTreeUri(this, uri)
-            refresh()
         }
     }
 
@@ -297,57 +286,33 @@ class MainActivity : Activity() {
         updateHeader()
         itemsContainer.removeAllViews()
         rows.clear()
+        localStateMs = 0L
         val loading = TextView(this).apply { text = "読み込み中…" }
         itemsContainer.addView(loading)
         thread(name = "scan", isDaemon = true) {
-            var driveError: String? = null
-            val driveItems = if (Store.treeUri(this) == null) {
-                emptyList()
-            } else {
-                try {
-                    Store.scan(this)
-                } catch (e: Exception) {
-                    driveError = "${e.javaClass.simpleName}: ${e.message}"
-                    emptyList()
-                }
-            }
-            // GitHub Releases source (pilot for moka-vpn in v0.1.8,
-            // generalised in v0.1.9, topic discovery in v0.1.12):
-            // repositories carrying the `android` topic are
+            // Whole-scan and GitHub-phase timing (see Timing).
+            val scanStart = Timing.now()
+            // GitHub Releases source — the only source since
+            // v0.2.0: repositories carrying the `android` topic are
             // discovered at scan time and every APK they publish
-            // gets a row, replacing the Drive row for the same
-            // file — the provider's view of those folders is
-            // exactly what cannot be trusted. The hardcoded map
+            // gets a row. The persisted repository list lets the
+            // scan start optimistically, and the hardcoded map
             // inside GitHubSource remains as the fallback for when
-            // discovery itself fails. When GitHub cannot be
-            // reached at all, the Drive row stays as the fallback.
+            // discovery itself fails (see GitHubSource.fetchAll).
+            val githubStart = Timing.now()
             val githubItems = try {
-                GitHubSource.fetchAll()
+                GitHubSource.fetchAll(this)
             } catch (e: Exception) {
                 emptyList()
             }
-            val githubFiles = githubItems.map { it.fileName.lowercase() }.toSet()
-            val items = (
-                driveItems.filterNot { it.fileName.lowercase() in githubFiles } +
-                    githubItems
-                ).sortedWith(compareBy({ it.project }, { it.fileName }))
+            val githubMs = Timing.now() - githubStart
+            val items = githubItems
+                .sortedWith(compareBy({ it.project }, { it.fileName }))
             runOnUiThread {
-                if (driveError != null) {
-                    itemsContainer.addView(TextView(this@MainActivity).apply {
-                        text = "Drive の読み込みに失敗しました: $driveError"
-                        textSize = 14f
-                    })
-                }
-                if (Store.treeUri(this) == null) {
-                    itemsContainer.addView(TextView(this@MainActivity).apply {
-                        text = "Drive の apps フォルダが未設定です。「フォルダを選ぶ」から指定すると Drive 側のアプリも表示されます（GitHub 側の行は設定なしで表示されます）。"
-                        textSize = 14f
-                    })
-                }
                 itemsContainer.removeView(loading)
                 if (items.isEmpty()) {
                     itemsContainer.addView(TextView(this).apply {
-                        text = "APK が見つかりませんでした。選んだフォルダが apps かどうかを確認してください。"
+                        text = "APK が見つかりませんでした。通信状態を確認して再読み込みしてください。"
                         textSize = 14f
                     })
                 }
@@ -365,6 +330,19 @@ class MainActivity : Activity() {
                         addRow(item)
                     }
                 }
+                // Whole-scan total runs from the scan thread's
+                // start to the end of row building, so it includes
+                // the per-row local-state lookups accumulated in
+                // localStateMs.
+                val totalMs = Timing.now() - scanStart
+                Timing.log("local state lookups (installed/downloaded, row build)", localStateMs)
+                Timing.log("scan total", totalMs)
+                val summary = "前回スキャン: 合計 ${Timing.fmt(totalMs)}ms / " +
+                    "GitHub ${Timing.fmt(githubMs)}ms / " +
+                    "ローカル ${Timing.fmt(localStateMs)}ms"
+                Timing.logLine(summary)
+                Timing.saveSummary(this@MainActivity, summary)
+                timingView.text = summary
                 maybeRunAuto()
             }
         }
@@ -400,7 +378,7 @@ class MainActivity : Activity() {
         val installedText = when {
             knownPackage == null -> "パッケージ: ダウンロード後に判明"
             else -> {
-                val info = Store.installedInfo(this, knownPackage)
+                val info = timedLocal { Store.installedInfo(this, knownPackage) }
                 if (info == null) {
                     "インストール済み: なし（$knownPackage）"
                 } else {
@@ -414,7 +392,7 @@ class MainActivity : Activity() {
         })
         val status = TextView(this).apply {
             textSize = 13f
-            text = Store.statusFor(this@MainActivity, item) ?: ""
+            text = timedLocal { Store.statusFor(this@MainActivity, item) } ?: ""
         }
         block.addView(status)
         val progress = ProgressBar(this, null, android.R.attr.progressBarStyleHorizontal).apply {
@@ -432,8 +410,8 @@ class MainActivity : Activity() {
             // currently offers. The install action re-hashes the
             // file itself, so this is only the visual gate.
             val expectedSha = item.update?.sha256
-            val recordedSha = Store.downloadedSha(this@MainActivity, item.fileName)
-            isEnabled = Store.downloadedFile(this@MainActivity, item.fileName).exists() &&
+            val recordedSha = timedLocal { Store.downloadedSha(this@MainActivity, item.fileName) }
+            isEnabled = timedLocal { Store.downloadedFile(this@MainActivity, item.fileName).exists() } &&
                 (expectedSha == null || recordedSha == null ||
                     expectedSha.equals(recordedSha, ignoreCase = true))
         }
@@ -463,27 +441,6 @@ class MainActivity : Activity() {
     private fun startDownload(row: Row) {
         if (row.downloading) return
         val item = row.item
-        // Preflight for Drive items: when update.json states a size
-        // and the provider's listing disagrees, the provider's view
-        // of the folder is stale (observed with moka-vpn: the
-        // listing still showed the previous generation while
-        // update.json was already current). Downloading would pull
-        // the stale bytes over a possibly metered line only to
-        // discard them on hash mismatch, so stop before any byte
-        // moves. GitHub items are exempt: their listing size comes
-        // from the same release record as update.json.
-        val offeredSize = item.update?.size
-        if (item.source == "Drive" && offeredSize != null && item.size > 0 &&
-            offeredSize != item.size
-        ) {
-            setRowStatus(
-                row,
-                "Drive 側の一覧が古い世代のままの可能性があります" +
-                    "（update.json: $offeredSize bytes / 一覧: ${item.size} bytes）。" +
-                    "ダウンロードを中止しました。"
-            )
-            return
-        }
         // Since v0.1.9 the transfer itself runs in DownloadService,
         // a foreground service: on a bare activity thread, the
         // system aborted the socket as soon as the app was
@@ -602,8 +559,4 @@ class MainActivity : Activity() {
 
     private fun fmtDate(millis: Long): String =
         SimpleDateFormat("yyyy-MM-dd HH:mm", Locale.getDefault()).format(Date(millis))
-
-    companion object {
-        private const val REQUEST_TREE = 1001
-    }
 }

@@ -1,15 +1,22 @@
 package dev.moriya.appsupdater
 
+import android.content.Context
 import org.json.JSONArray
 import org.json.JSONObject
 import java.net.HttpURLConnection
 import java.net.URL
 import java.net.URLEncoder
+import java.util.concurrent.Callable
+import java.util.concurrent.ExecutorService
+import java.util.concurrent.Executors
+import java.util.concurrent.Future
+import java.util.concurrent.atomic.AtomicLong
 
 /**
- * GitHub Releases source (pilot in v0.1.8 for moka-vpn only,
- * generalised to every known project in v0.1.9, repository
- * discovery added in v0.1.12).
+ * GitHub Releases source — the ONLY source since v0.2.0 (the
+ * Drive/SAF source was removed; see below). Piloted on moka-vpn
+ * in v0.1.8, generalised to every known project in v0.1.9,
+ * repository discovery added in v0.1.12.
  *
  * Why this exists: the on-device Drive documents provider
  * repeatedly served a stale generation of an APK while update.json
@@ -45,6 +52,20 @@ import java.net.URLEncoder
  * primary one's metadata lives in update.json for now — other
  * files fall back to asset size + digest verification).
  *
+ * Scan speed (v0.2.0): on-device measurements (timing-test builds,
+ * 2026-11-19) showed the GitHub phase was ~90% of an 8.2s scan
+ * when repositories were fetched one after another. Three
+ * measures, all verified on the timing-test branch:
+ *  - repositories are fetched concurrently on a bounded pool
+ *    (4 threads), futures joined in discovery order so the item
+ *    order is identical to the sequential version's;
+ *  - the scan starts optimistically from the repository list the
+ *    previous successful discovery persisted (see [fetchAll]):
+ *    those fetches run while discovery is still in flight;
+ *  - API requests carry Cache-Control: no-cache, so a refresh
+ *    always reads the current state.
+ * The request count per scan is unchanged by all three.
+ *
  * All repositories are public; no token is used or needed. The
  * unauthenticated search API allows 10 requests/minute, far above
  * this app's user-triggered refresh rate.
@@ -57,10 +78,8 @@ object GitHubSource {
 
     /** APK file name -> "owner/repo" that publishes it as Release
      *  assets. Since v0.1.12 this map is the FALLBACK, used only
-     *  when topic discovery fails or finds nothing; discovery is
-     *  the primary source. A file listed here gets a GitHub row
-     *  whenever a matching release is reachable, replacing its
-     *  Drive row. */
+     *  when topic discovery fails or finds nothing AND no persisted
+     *  repository list exists; discovery is the primary source. */
     val FILE_REPO: Map<String, String> = mapOf(
         "mokavpn.apk" to "ysk-agent/moka-vpn",
         "apps-updater.apk" to "ysk-agent/apps-updater",
@@ -82,26 +101,148 @@ object GitHubSource {
      *  arrays are stored, so a failed fetch never poisons a scan. */
     private val releasesCache = mutableMapOf<String, JSONArray>()
 
-    /** Every GitHub-sourced item for one scan: topic discovery
-     *  first, the hardcoded [FILE_REPO] map as fallback when
-     *  discovery fails or returns no repositories. */
-    fun fetchAll(): List<ApkItem> {
+    /** One lock object per repo, so concurrent workers fetching
+     *  DIFFERENT repos never block each other, while two workers
+     *  asking for the SAME repo serialise and the second one reuses
+     *  the first's fetch instead of issuing a duplicate request.
+     *  Cleared with [releasesCache] at the start of every scan. */
+    private val repoFetchLocks = mutableMapOf<String, Any>()
+
+    private fun repoFetchLock(repo: String): Any =
+        synchronized(repoFetchLocks) { repoFetchLocks.getOrPut(repo) { Any() } }
+
+    // -- persisted repository list (optimistic start) ---------------
+
+    private const val PREFS = "appsupdater-github"
+    private const val KEY_KNOWN_REPOS = "known_repos"
+
+    /** The repository list the last successful discovery returned,
+     *  persisted across process restarts; empty on first run. */
+    private fun loadKnownRepos(context: Context): List<String> =
+        context.applicationContext
+            .getSharedPreferences(PREFS, Context.MODE_PRIVATE)
+            .getString(KEY_KNOWN_REPOS, null)
+            ?.split('\n')?.filter { it.isNotBlank() }
+            ?: emptyList()
+
+    private fun saveKnownRepos(context: Context, repos: List<String>) {
+        context.applicationContext
+            .getSharedPreferences(PREFS, Context.MODE_PRIVATE)
+            .edit().putString(KEY_KNOWN_REPOS, repos.joinToString("\n")).apply()
+    }
+
+    // -- scan timing --------------------------------------------------
+
+    /** Breakdown of the most recent [fetchAll] scan. [discoveryMs]
+     *  and [totalMs] are written only by the thread that called
+     *  fetchAll. [updateJsonMs] is accumulated from the per-repo
+     *  worker threads (repositories are fetched concurrently), so
+     *  it is atomic. */
+    class ScanTimings {
+        var discoveryMs: Long? = null
+        val updateJsonMs = AtomicLong(0L)
+        var totalMs: Long? = null
+    }
+
+    @Volatile
+    var lastScanTimings: ScanTimings = ScanTimings()
+        private set
+
+    // -- scan -----------------------------------------------------------
+
+    /** Every GitHub-sourced item for one scan.
+     *
+     *  Optimistic start (v0.2.0): when a previous scan persisted a
+     *  repository list, fetches for those repositories are
+     *  submitted immediately and discovery runs CONCURRENTLY
+     *  instead of first. Discovery remains authoritative: a repo
+     *  that discovery no longer returns is dropped (its in-flight
+     *  items are discarded), a newly discovered repo is fetched
+     *  when discovery returns, and the list is re-persisted. A
+     *  repository that was renamed since the last scan is simply a
+     *  failed fetch under its old name plus a normal fetch under
+     *  its new one — the user explicitly accepted that optimism.
+     *  When discovery fails or returns nothing, the persisted
+     *  list's results are used as-is; with no persisted list either,
+     *  the hardcoded [FILE_REPO] map is the fallback. The first-ever
+     *  scan (no persisted list) is discovery-first, exactly like
+     *  v0.1.13 plus parallel fetching. */
+    fun fetchAll(context: Context): List<ApkItem> {
+        val totalStart = Timing.now()
+        val timings = ScanTimings()
+        lastScanTimings = timings
         // Per-scan cache: every scan starts from fresh release lists.
         synchronized(releasesCache) { releasesCache.clear() }
-        val repos = discoverRepos()
-        if (repos.isNullOrEmpty()) {
-            return FILE_REPO.keys.mapNotNull { fileName ->
-                try {
-                    fetchItem(fileName)
-                } catch (e: Exception) {
-                    null
+        synchronized(repoFetchLocks) { repoFetchLocks.clear() }
+
+        val pool = Executors.newFixedThreadPool(4)
+        try {
+            val known = loadKnownRepos(context)
+            Timing.log("github optimistic repos ${known.size}")
+            // Optimistic submissions: known repos start fetching
+            // NOW, before (and while) discovery runs.
+            val optimistic = LinkedHashMap<String, Future<List<ApkItem>>>()
+            for (repo in known) {
+                optimistic[repo] = submitRepo(pool, repo)
+            }
+
+            val discoveryStart = Timing.now()
+            val discovered = discoverRepos()
+            timings.discoveryMs = Timing.now() - discoveryStart
+            Timing.log("github discovery", timings.discoveryMs!!)
+
+            val result: List<ApkItem> = when {
+                !discovered.isNullOrEmpty() -> {
+                    saveKnownRepos(context, discovered)
+                    val futures = LinkedHashMap<String, Future<List<ApkItem>>>()
+                    for (repo in discovered) {
+                        futures[repo] = optimistic.remove(repo) ?: submitRepo(pool, repo)
+                    }
+                    // Whatever is left in `optimistic` belongs to
+                    // repositories discovery no longer returns:
+                    // their results are discarded by never joining
+                    // those futures.
+                    joinInOrder(futures)
+                }
+                known.isNotEmpty() -> joinInOrder(optimistic)
+                else -> FILE_REPO.keys.mapNotNull { fileName ->
+                    try {
+                        fetchItem(fileName)
+                    } catch (e: Exception) {
+                        null
+                    }
                 }
             }
+            timings.totalMs = Timing.now() - totalStart
+            Timing.log("github update.json total", timings.updateJsonMs.get())
+            Timing.log("github total", timings.totalMs!!)
+            return result
+        } finally {
+            pool.shutdown()
         }
-        val items = mutableListOf<ApkItem>()
-        for (repo in repos) {
+    }
+
+    private fun submitRepo(
+        pool: ExecutorService, repo: String
+    ): Future<List<ApkItem>> =
+        pool.submit(Callable<List<ApkItem>> {
             try {
-                items += fetchRepoItems(repo)
+                fetchRepoItems(repo)
+            } catch (e: Exception) {
+                // One bad repository must not sink the whole scan.
+                emptyList()
+            }
+        })
+
+    /** Join futures in map (discovery / persisted-list) order, so
+     *  the item order is identical to the sequential version's. */
+    private fun joinInOrder(
+        futures: Map<String, Future<List<ApkItem>>>
+    ): List<ApkItem> {
+        val items = mutableListOf<ApkItem>()
+        for ((_, future) in futures) {
+            try {
+                items += future.get()
             } catch (e: Exception) {
                 // One bad repository must not sink the whole scan.
             }
@@ -171,7 +312,7 @@ object GitHubSource {
 
     /** The GitHub-sourced item for [fileName] in [repo], or null
      *  when no qualifying release carries it or GitHub is
-     *  unreachable (callers then keep the Drive row). */
+     *  unreachable. */
     private fun fetchItem(fileName: String, repo: String): ApkItem? {
         val releases = releasesFor(repo) ?: return null
 
@@ -205,7 +346,11 @@ object GitHubSource {
         if (updateAsset != null) {
             val url = updateAsset.optString("browser_download_url")
             if (url.isNotEmpty()) {
+                // Accumulate update.json fetch time (atomic: this
+                // runs on several worker threads concurrently).
+                val updateJsonStart = Timing.now()
                 val text = httpGetText(url)
+                lastScanTimings.updateJsonMs.addAndGet(Timing.now() - updateJsonStart)
                 if (text != null) {
                     val parsed = Store.parseUpdate(text)
                     if (parsed != null && parsed.file == fileName) update = parsed
@@ -219,7 +364,6 @@ object GitHubSource {
         return ApkItem(
             project = repo.substringAfter('/'),
             fileName = fileName,
-            docUri = null,
             size = if (assetSize > 0) assetSize else (update?.size ?: -1L),
             modified = parseIsoTime(apkAsset.optString("updated_at")),
             update = update,
@@ -233,20 +377,34 @@ object GitHubSource {
         synchronized(releasesCache) {
             if (releasesCache.containsKey(repo)) return releasesCache[repo]
         }
-        val text = httpGetText("https://api.github.com/repos/$repo/releases?per_page=30")
-        val parsed = text?.let {
-            try {
-                JSONArray(it)
-            } catch (e: Exception) {
-                null
+        // Serialise on this repo's own lock only. Different repos
+        // fetch in parallel; a second caller for the same repo
+        // waits, then re-checks the cache and reuses the first
+        // caller's result — the releases list is never fetched
+        // twice for one repo in one scan.
+        synchronized(repoFetchLock(repo)) {
+            synchronized(releasesCache) {
+                if (releasesCache.containsKey(repo)) return releasesCache[repo]
             }
+            // Only real fetches are timed; per-scan cache hits
+            // return above without a log line.
+            val fetchStart = Timing.now()
+            val text = httpGetText("https://api.github.com/repos/$repo/releases?per_page=30")
+            val parsed = text?.let {
+                try {
+                    JSONArray(it)
+                } catch (e: Exception) {
+                    null
+                }
+            }
+            Timing.log("github releases $repo", Timing.now() - fetchStart)
+            // Cache only successful parses: a failed fetch must not
+            // poison the rest of this scan (or any later one).
+            if (parsed != null) {
+                synchronized(releasesCache) { releasesCache[repo] = parsed }
+            }
+            return parsed
         }
-        // Cache only successful parses: a failed fetch must not
-        // poison the rest of this scan (or any later one).
-        if (parsed != null) {
-            synchronized(releasesCache) { releasesCache[repo] = parsed }
-        }
-        return parsed
     }
 
     private fun findAsset(assets: JSONArray, name: String): JSONObject? {
@@ -275,8 +433,10 @@ object GitHubSource {
 
     /** Small text GET for API/update.json payloads. Asset bytes do
      *  NOT go through here — Store streams those with progress and
-     *  hashing. Returns null on any failure: GitHub is an optional
-     *  source and must never break the Drive listing. */
+     *  hashing. Returns null on any failure: GitHub being
+     *  unreachable must never break the listing. Cache-Control:
+     *  no-cache makes every refresh read the current state instead
+     *  of an HTTP-cached response (v0.2.0). */
     private fun httpGetText(url: String): String? {
         var conn: HttpURLConnection? = null
         return try {
@@ -285,6 +445,7 @@ object GitHubSource {
                 readTimeout = 15_000
                 setRequestProperty("Accept", "application/vnd.github+json")
                 setRequestProperty("User-Agent", "AppsUpdater")
+                setRequestProperty("Cache-Control", "no-cache")
             }
             if (conn.responseCode !in 200..299) return null
             conn.inputStream.bufferedReader().use { it.readText() }

@@ -11,8 +11,8 @@ android {
         applicationId = "dev.moriya.appsupdater"
         minSdk = 29
         targetSdk = 34
-        versionCode = 14
-        versionName = "0.1.13"
+        versionCode = 15
+        versionName = "0.2.0"
     }
 
     // Pinned signing key, same pattern as yt-player / phone-node-waker:
@@ -51,7 +51,7 @@ android {
 }
 
 // No dependencies on purpose: the whole app is framework APIs only
-// (SAF / DocumentsContract, MediaStore, PackageInstaller), which keeps
+// (MediaStore, PackageInstaller, HttpURLConnection), which keeps
 // the APK small and the build free of dependency surprises.
 dependencies {
 }

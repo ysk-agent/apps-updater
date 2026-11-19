@@ -7,7 +7,6 @@ import android.app.Service
 import android.content.Context
 import android.content.Intent
 import android.content.pm.ServiceInfo
-import android.net.Uri
 import android.os.Build
 import android.os.IBinder
 import java.util.concurrent.Executors
@@ -167,7 +166,6 @@ class DownloadService : Service() {
         private const val X_SOURCE = "source"
         private const val X_SIZE = "size"
         private const val X_MODIFIED = "modified"
-        private const val X_DOC_URI = "docUri"
         private const val X_DOWNLOAD_URL = "downloadUrl"
         private const val X_ASSET_DIGEST = "assetDigest"
         private const val X_U_FILE = "u_file"
@@ -188,7 +186,6 @@ class DownloadService : Service() {
                 putExtra(X_SOURCE, item.source)
                 putExtra(X_SIZE, item.size)
                 putExtra(X_MODIFIED, item.modified)
-                putExtra(X_DOC_URI, item.docUri?.toString())
                 putExtra(X_DOWNLOAD_URL, item.downloadUrl)
                 putExtra(X_ASSET_DIGEST, item.assetDigest)
                 item.update?.let { u ->
@@ -220,11 +217,10 @@ class DownloadService : Service() {
             return ApkItem(
                 project = intent.getStringExtra(X_PROJECT) ?: "",
                 fileName = fileName,
-                docUri = intent.getStringExtra(X_DOC_URI)?.let { Uri.parse(it) },
                 size = intent.getLongExtra(X_SIZE, -1L),
                 modified = intent.getLongExtra(X_MODIFIED, 0L),
                 update = update,
-                source = intent.getStringExtra(X_SOURCE) ?: "Drive",
+                source = intent.getStringExtra(X_SOURCE) ?: "GitHub",
                 downloadUrl = intent.getStringExtra(X_DOWNLOAD_URL),
                 assetDigest = intent.getStringExtra(X_ASSET_DIGEST)
             )

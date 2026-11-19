@@ -1,42 +1,57 @@
 # Apps Updater
 
-A small, dependency-free Android app that lists the APKs published in
-Moriya's Google Drive `apps` folder and updates them on the device.
+A small, dependency-free Android app that lists the APKs published
+as GitHub Releases by Moriya's watched repositories and updates
+them on the device.
 
 ## Why
 
-Hand-carrying every new build from Drive to the phone is the slow
-step in the develop–test cycle for the phone-node family of apps.
-The VM-to-phone adb/Tailscale link is also slow (a few hundred KB/s),
-so pushing a 108 MB APK over it is painful. This app inverts the
-flow: the phone downloads the APK itself, at its own line speed,
-through the Drive app's document provider; adb then only has to say
-"install this file that is already here".
+Hand-carrying every new build to the phone is the slow step in the
+develop–test cycle for the phone-node family of apps. The VM-to-
+phone adb/Tailscale link is also slow (a few hundred KB/s), so
+pushing a 108 MB APK over it is painful. This app inverts the flow:
+the phone downloads the APK itself, at its own line speed, over
+HTTPS from GitHub; adb then only has to say "install this file
+that is already here".
 
-## GitHub Releases source
+## GitHub Releases source (the only source since v0.2.0)
 
-Since v0.1.8 (moka-vpn pilot) and generalised in v0.1.9, every APK
-with a known publishing repository (see `GitHubSource.FILE_REPO`:
-moka-vpn, apps-updater, phone-node, phone-node-waker, yt-player)
-is fetched from GitHub Releases (tags of the form `vX.Y.Z`) over
-plain HTTPS instead of through the Drive provider: on a real
-device the provider kept serving the first-indexed generation of
-a folder (stale listing metadata and stale APK bytes for a
-brand-new document) while `update.json` read fresh. A GitHub row
-replaces the Drive row for the same file whenever it can be
-fetched; the Drive row remains as the offline fallback. Downloads
-are verified against both `update.json`'s SHA-256 (when the
-release carries one naming that file) and the release asset's own
-`digest` from the GitHub API. Selection does not use
-`/releases/latest` (an unrelated AAR-cache release holds that slot
-in the moka-vpn repository); the highest `vX.Y.Z` tag carrying the
-file wins.
+Until v0.1.13 the app also listed a Google Drive `apps` folder
+(granted via SAF). The Drive documents provider repeatedly served
+the first-indexed generation of a folder (stale listing metadata
+and stale APK bytes for a brand-new document) while `update.json`
+read fresh, so GitHub Releases took over row by row from v0.1.8
+on, and v0.2.0 removed the Drive source entirely once every
+project had a GitHub Release. No folder grant is needed any more.
 
-For Drive items, a preflight guard compares the listing size with
-`update.json`'s stated size before downloading: a disagreement
-means the provider's view is stale, and the download is refused
-before any byte moves (the stale bytes would only be discarded on
-hash mismatch anyway, at metered-line cost).
+Repositories are discovered at scan time by searching GitHub for
+the owner's repositories carrying the `android` topic
+(`user:ysk-agent topic:android`); every `.apk` asset of their
+qualifying releases gets a row. A new Android project appears as
+soon as its repository carries the topic and a release — no Apps
+Updater release in between. The hardcoded `GitHubSource.FILE_REPO`
+map remains as the fallback when discovery itself fails.
+Selection does not use `/releases/latest` (an unrelated AAR-cache
+release holds that slot in the moka-vpn repository); only tags of
+the form `vX.Y.Z` qualify, and the highest such tag carrying the
+file wins. Downloads are verified against both `update.json`'s
+SHA-256 (when the release carries one naming that file) and the
+release asset's own `digest` from the GitHub API.
+
+### Scan speed (v0.2.0)
+
+On-device measurements (2026-11-19, timing-test builds) showed the
+GitHub phase was ~90% of an 8.2 s scan when repositories were
+fetched one after another. v0.2.0 therefore fetches repositories
+concurrently (bounded pool of 4, results joined in discovery
+order), starts optimistically from the repository list persisted
+by the previous successful discovery (those fetches run while
+discovery is still in flight; discovery remains authoritative),
+and sends `Cache-Control: no-cache` on API requests so a refresh
+always reads the current state. The request count per scan is
+unchanged. The header keeps the last scan's timing summary
+(合計 / GitHub / ローカル) and every phase is logged to logcat
+under the `UpdaterTiming` tag.
 
 ## Background downloads (v0.1.9)
 
@@ -55,19 +70,18 @@ file.
 
 ## How it works
 
-- One-time setup on the device: open the app, tap 「フォルダを選ぶ」,
-  and pick the Drive `apps` folder (SAF grant; the app holds no
-  Google credentials — the Drive app brokers access with the phone's
-  own account, so the folder stays private). Also allow
+- One-time setup on the device: none for listing. Allow
   「不明なアプリのインストール」 for this app if you want in-app
   installs.
-- The main screen lists every project folder under `apps` and every
-  APK inside it, with:
-  - Drive size and modification time,
+- The main screen lists one section per project (repository) and
+  every APK it publishes, with:
+  - release asset size and update time,
   - the installed version (for known packages, and for any package
     once its APK has been downloaded and parsed),
-  - `update.json` metadata when the project folder carries one.
-- 「ダウンロード」 copies the APK into internal storage, verifies
+  - `update.json` metadata when the release carries one naming
+    that file.
+- 「ダウンロード」 downloads the APK into the app's internal
+  downloads directory (the single APK storage location), verifies
   SHA-256 when `update.json` provides one (a mismatch blocks the
   install), and publishes the same bytes to
   `Download/apps-updater/<file>` on shared storage, plus a
@@ -87,7 +101,7 @@ file.
 python3 tools/adb_update.py \
   --adb /path/to/adb --serial <device> \
   --project phone-node-waker --file phone-node-waker.apk \
-  --sha256 <hex of the Drive file> --package dev.moriya.phonenode.waker
+  --sha256 <hex of the published APK> --package dev.moriya.phonenode.waker
 ```
 
 It force-stops the app and starts it with `auto_project` /
@@ -104,8 +118,8 @@ through `/data/local/tmp` with an on-device copy first.
 
 ## update.json format
 
-Publishers place an `update.json` next to the APK in each project
-folder. All fields except `file` are optional; phone-node's legacy
+Publishers attach an `update.json` asset to each release. All
+fields except `file` are optional; phone-node's legacy
 `{"buildId": ..., "file": ...}` form is read as-is.
 
 ```json
@@ -128,7 +142,9 @@ folder. All fields except `file` are optional; phone-node's legacy
 | phone-node-waker.apk | dev.moriya.phonenode.waker |
 | yt-player.apk | app.ytplayer |
 | apps-updater.apk | dev.moriya.appsupdater |
+| mokavpn.apk | dev.moriya.vpn |
 | findmy-mac.apk | dev.moriya.findmymac |
+| yt-client.apk | app.ytclient |
 
 Unknown APKs still list, download, and install; their package name
 and version are read from the downloaded APK itself.
@@ -139,6 +155,6 @@ Gradle builds run in GitHub Actions on this public repository
 (Gradle cannot run on the Muse VM: JVM loopback TCP is intercepted
 there). Signing uses one pinned keystore held in repository secrets,
 so every build overwrite-installs over the previous one. The fixed
-distribution file name is `apps-updater.apk`, published to the Drive
-folder `apps/apps-updater` together with its `update.json`. CI also
+distribution file name is `apps-updater.apk`, published as a
+GitHub Release asset together with its `update.json`. CI also
 runs an emulator launch test with screenshots of the main screen.

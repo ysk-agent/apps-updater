@@ -16,10 +16,9 @@
     <uses-permission android:name="android.permission.UPDATE_PACKAGES_WITHOUT_USER_ACTION" />
     <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
     <!-- GitHub Releases source (pilot in v0.1.8 for moka-vpn,
-         generalised in v0.1.9): the on-device Drive provider served
-         stale bytes for current releases, so known projects are
-         fetched over plain HTTPS instead. No credentials: the
-         repositories are public. -->
+         generalised in v0.1.9, the only source since v0.2.0):
+         projects are fetched over plain HTTPS. No credentials:
+         the repositories are public. -->
     <uses-permission android:name="android.permission.INTERNET" />
     <!-- Foreground-service downloads (v0.1.9): transfers run in
          DownloadService so backgrounding the app no longer aborts
