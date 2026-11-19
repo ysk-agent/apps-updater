@@ -74,17 +74,20 @@ object GitHubSource {
 
     private val VERSION_TAG = Regex("""^v(\d+)\.(\d+)\.(\d+)$""")
 
-    /** Chosen release per repo, cached for the process lifetime of
-     *  one scan: several files can share a repo (phone-node), and
-     *  re-listing releases per file would multiply API calls. The
-     *  cache is keyed by repo and stores the parsed releases array
-     *  once; selection per file happens against it. */
-    private val releasesCache = mutableMapOf<String, JSONArray?>()
+    /** Parsed releases array per repo, cached for ONE scan only:
+     *  several files can share a repo (phone-node), and re-listing
+     *  releases per file would multiply API calls. [fetchAll]
+     *  clears the cache at the start of every scan, so each scan
+     *  fetches fresh release lists; only successfully parsed
+     *  arrays are stored, so a failed fetch never poisons a scan. */
+    private val releasesCache = mutableMapOf<String, JSONArray>()
 
     /** Every GitHub-sourced item for one scan: topic discovery
      *  first, the hardcoded [FILE_REPO] map as fallback when
      *  discovery fails or returns no repositories. */
     fun fetchAll(): List<ApkItem> {
+        // Per-scan cache: every scan starts from fresh release lists.
+        synchronized(releasesCache) { releasesCache.clear() }
         val repos = discoverRepos()
         if (repos.isNullOrEmpty()) {
             return FILE_REPO.keys.mapNotNull { fileName ->
@@ -238,7 +241,11 @@ object GitHubSource {
                 null
             }
         }
-        synchronized(releasesCache) { releasesCache[repo] = parsed }
+        // Cache only successful parses: a failed fetch must not
+        // poison the rest of this scan (or any later one).
+        if (parsed != null) {
+            synchronized(releasesCache) { releasesCache[repo] = parsed }
+        }
         return parsed
     }
 
