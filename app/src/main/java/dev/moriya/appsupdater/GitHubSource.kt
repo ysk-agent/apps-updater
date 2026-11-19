@@ -44,7 +44,8 @@ object GitHubSource {
         "phonenode-helper.apk" to "ysk-agent/phone-node",
         "phone-node-waker.apk" to "ysk-agent/phone-node-waker",
         "yt-player.apk" to "ysk-agent/yt-player",
-        "findmy-mac.apk" to "ysk-agent/findmy-mac"
+        "findmy-mac.apk" to "ysk-agent/findmy-mac",
+        "yt-client.apk" to "ysk-agent/yt-client-android"
     )
 
     private val VERSION_TAG = Regex("""^v(\d+)\.(\d+)\.(\d+)$""")
