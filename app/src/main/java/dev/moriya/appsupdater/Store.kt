@@ -72,6 +72,41 @@ object Store {
         "mokavpn.apk" to "dev.moriya.vpn"
     )
 
+    private const val KEY_PKG_PREFIX = "pkg_"
+
+    /** Package name learned by probing the release asset itself
+     *  (v0.2.1, see PackageProbe), persisted per file name so the
+     *  probe runs at most once per file. */
+    fun learnedPackage(context: Context, fileName: String): String? =
+        context.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
+            .getString(KEY_PKG_PREFIX + fileName, null)
+
+    fun learnPackage(context: Context, fileName: String, packageName: String) {
+        context.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
+            .edit().putString(KEY_PKG_PREFIX + fileName, packageName).apply()
+    }
+
+    /**
+     * The package name for [fileName], from the curated
+     * [KNOWN_PACKAGES] map or, failing that, the learned map. A
+     * learned value never silently overrides a known entry: the
+     * map is curated and the probe is heuristic, so on disagreement
+     * the known entry wins and the disagreement is logged.
+     */
+    fun packageFor(context: Context, fileName: String): String? {
+        val known = KNOWN_PACKAGES[fileName]
+        val learned = learnedPackage(context, fileName)
+        if (known != null) {
+            if (learned != null && learned != known) {
+                Timing.logLine(
+                    "package learned $learned for $fileName disagrees with known $known; using known"
+                )
+            }
+            return known
+        }
+        return learned
+    }
+
     // -- prefs ------------------------------------------------------------
 
     /**

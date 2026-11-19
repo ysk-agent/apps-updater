@@ -51,6 +51,28 @@ adb shell pm grant $PKG android.permission.POST_NOTIFICATIONS || true
 # Light-mode screenshot first (the emulator boots in light mode).
 adb shell am start -n $PKG/.MainActivity
 sleep 5
+
+# --- Package-probe evidence (v0.2.1) ------------------------------
+# The first scan must learn the packages of the files that are not
+# in the hardcoded map (findmy-mac.apk, yt-client.apk) by
+# range-probing their release assets, logging one
+# "package probe <file>: <package> (<n> req, <b> B, <ms>ms)" line
+# per file under the UpdaterTiming tag. Poll for the scan's
+# completion line, then capture the timing log BEFORE the
+# `logcat -c` further down wipes it.
+for i in $(seq 1 45); do
+  if adb logcat -d -s UpdaterTiming 2>/dev/null | grep -q "scan total"; then break; fi
+  sleep 2
+done
+adb logcat -d -s UpdaterTiming > probe-logcat.txt 2>&1 || true
+cat probe-logcat.txt
+if grep -q "package probe findmy-mac.apk: dev.moriya.findmymac" probe-logcat.txt && \
+   grep -q "package probe yt-client.apk: app.ytclient" probe-logcat.txt; then
+  echo "OK: package probe learned findmy-mac + yt-client packages from their assets"
+else
+  note_fail "package probe did not learn findmy-mac/yt-client packages (see probe-logcat.txt)"
+fi
+
 screencap screenshot-main-light.png
 
 # Moriya's phones run in dark mode; capture the rest in dark mode.
@@ -153,6 +175,12 @@ else
 fi
 kill $HTTP_PID 2>/dev/null || true
 
+# Scrolled screenshot (v0.2.1): bring the last projects' rows into
+# view so the learned-package rows (yt-client) can be inspected
+# visually, not only via logcat.
+for i in 1 2 3 4 5; do adb shell input swipe 540 1600 540 500 250 >/dev/null 2>&1; sleep 1; done
+screencap screenshot-scrolled.png
+
 adb shell dumpsys activity activities > dumpsys-activities.txt 2>&1 || true
 adb logcat -d -v threadtime > logcat.txt 2>&1 || true
 adb shell uiautomator dump /sdcard/window_dump.xml >/dev/null 2>&1 || true
@@ -161,6 +189,16 @@ adb pull /sdcard/window_dump.xml window_dump.xml >/dev/null 2>&1 || true
 if grep -q "FATAL EXCEPTION" logcat.txt && grep -A3 "FATAL EXCEPTION" logcat.txt | grep -q "$PKG"; then
   note_fail "FATAL EXCEPTION for $PKG in logcat"
 fi
+
+# Diagnostic (not a failure): the learned package names should
+# also appear in the rendered rows of the final UI dump.
+for p in dev.moriya.findmymac app.ytclient; do
+  if grep -q "$p" window_dump.xml; then
+    echo "UI dump contains learned package: $p"
+  else
+    echo "NOTE: UI dump does not contain learned package: $p"
+  fi
+done
 
 echo "LAUNCH_TEST_FAIL=$FAIL"
 exit $FAIL

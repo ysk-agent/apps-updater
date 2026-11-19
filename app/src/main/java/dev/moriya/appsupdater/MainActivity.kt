@@ -398,7 +398,7 @@ class MainActivity : Activity() {
                 textSize = 13f
             })
         }
-        val knownPackage = Store.KNOWN_PACKAGES[item.fileName]
+        val knownPackage = Store.packageFor(this, item.fileName)
         val installedText = when {
             knownPackage == null -> "パッケージ: ダウンロード後に判明"
             else -> {

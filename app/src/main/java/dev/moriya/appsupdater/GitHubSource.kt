@@ -75,6 +75,16 @@ import java.util.concurrent.Future
  *    930ms releases-only, so this removes the dominant remaining
  *    cost and one request per published file.
  *
+ * Package learning (v0.2.1): the installed-version column needs
+ * each file's package name. The curated map in Store predates the
+ * newest projects (findmy-mac.apk, yt-client.apk were missing, so
+ * their rows showed no installed version), so after the items are
+ * built, any file whose package is still unknown is probed once:
+ * a few HTTP Range requests read the package name out of the
+ * asset's own AndroidManifest.xml (see PackageProbe) and the
+ * result is persisted. The probe fetches ranges of the APK asset
+ * only — update.json stays out of the scan.
+ *
  * All repositories are public; no token is used or needed. The
  * unauthenticated search API allows 10 requests/minute, far above
  * this app's user-triggered refresh rate.
@@ -218,11 +228,59 @@ object GitHubSource {
                     }
                 }
             }
+            // Package learning (v0.2.1): rows whose package is in
+            // neither the curated map nor the learned map get one
+            // range probe of their own asset (see PackageProbe),
+            // on this same pool, before the scan is reported done —
+            // so the rows the caller renders already know their
+            // installed version and update judgement.
+            learnUnknownPackages(context, result, pool)
             timings.totalMs = Timing.now() - totalStart
             Timing.log("github total", timings.totalMs!!)
             return result
         } finally {
             pool.shutdown()
+        }
+    }
+
+    /** Probe the assets of every item whose package name is still
+     *  unknown, in parallel on the scan pool, and persist what was
+     *  learned. Files already covered by the curated map or a
+     *  previous probe are never probed again. A failed probe
+     *  changes nothing: the row renders exactly as in v0.2.0 and
+     *  the next scan retries. */
+    private fun learnUnknownPackages(
+        context: Context,
+        items: List<ApkItem>,
+        pool: ExecutorService
+    ) {
+        val targets = items
+            .filter { it.downloadUrl != null && it.size > 0 }
+            .distinctBy { it.fileName }
+            .filter { Store.packageFor(context, it.fileName) == null }
+        if (targets.isEmpty()) return
+        val futures = targets.map { item ->
+            item to pool.submit(Callable<PackageProbe.Outcome> {
+                val start = Timing.now()
+                val outcome = PackageProbe.probe(item.downloadUrl!!, item.size)
+                Timing.logLine(
+                    "package probe ${item.fileName}: " +
+                        (outcome.packageName ?: "failed") +
+                        " (${outcome.requests} req, ${outcome.bytes} B, " +
+                        "${Timing.now() - start}ms)"
+                )
+                outcome
+            })
+        }
+        for ((item, future) in futures) {
+            val outcome = try {
+                future.get()
+            } catch (e: Exception) {
+                null
+            }
+            if (outcome?.packageName != null) {
+                Store.learnPackage(context, item.fileName, outcome.packageName)
+            }
         }
     }
 

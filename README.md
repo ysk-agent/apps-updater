@@ -88,10 +88,10 @@ file.
 - The main screen lists one section per project (repository) and
   every APK it publishes, with:
   - release asset size and update time,
-  - the installed version (for known packages, and for any package
-    once its APK has been downloaded and parsed), with a
-    「・更新あり」 mark when the latest version-name tuple is
-    strictly newer than the installed one,
+  - the installed version (for known packages, and for any other
+    package once the app has learned it — see "Known packages"
+    below), with a 「・更新あり」 mark when the latest
+    version-name tuple is strictly newer than the installed one,
   - the latest version name from the release tag and whether the
     asset carries a SHA-256 digest.
 - 「ダウンロード」 downloads the APK into the app's internal
@@ -163,8 +163,15 @@ fields except `file` are optional; phone-node's legacy
 | findmy-mac.apk | dev.moriya.findmymac |
 | yt-client.apk | app.ytclient |
 
-Unknown APKs still list, download, and install; their package name
-and version are read from the downloaded APK itself.
+Since v0.2.1 the table is only the curated seed. For a file that
+is in neither the table nor the learned map, the scan probes the
+release asset itself once — a few HTTP Range requests read the
+ZIP central directory and just the `AndroidManifest.xml` entry
+(never the whole APK, and never update.json) — and persists the
+learned file → package mapping on the device. A learned value
+never overrides a table entry. Unknown APKs whose probe fails
+still list, download, and install exactly as before; their
+package name is then read from the downloaded APK itself.
 
 ## Build and handover
 

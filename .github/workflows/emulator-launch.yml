@@ -71,11 +71,13 @@ jobs:
           name: launch-diagnostics
           path: |
             logcat.txt
+            probe-logcat.txt
             dumpsys-activities.txt
             window_dump.xml
             screenshot-main.png
             screenshot-main-light.png
             screenshot-auto.png
+            screenshot-scrolled.png
           if-no-files-found: warn
 
       - name: Upload APK
