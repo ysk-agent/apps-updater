@@ -4,10 +4,12 @@ import org.json.JSONArray
 import org.json.JSONObject
 import java.net.HttpURLConnection
 import java.net.URL
+import java.net.URLEncoder
 
 /**
  * GitHub Releases source (pilot in v0.1.8 for moka-vpn only,
- * generalised to every known project in v0.1.9).
+ * generalised to every known project in v0.1.9, repository
+ * discovery added in v0.1.12).
  *
  * Why this exists: the on-device Drive documents provider
  * repeatedly served a stale generation of an APK while update.json
@@ -20,6 +22,19 @@ import java.net.URL
  * (against update.json and against the digest) before it can be
  * installed.
  *
+ * Discovery (v0.1.12): the repositories to watch are no longer
+ * only the hardcoded [FILE_REPO] map. The app searches GitHub for
+ * the owner's repositories carrying the `android` topic
+ * (search/repositories?q=user:ysk-agent+topic:android) and, for
+ * each discovered repository, enumerates the `.apk` assets of its
+ * qualifying releases. A new Android project then appears in the
+ * list as soon as its repository carries the topic and a release —
+ * with no Apps Updater release of its own in between (the failure
+ * that hid yt-client in v0.1.10/v0.1.11). [FILE_REPO] remains as
+ * the fallback: when discovery fails (unreachable, rate limited)
+ * or returns nothing at all, the scan falls back to the hardcoded
+ * map so the GitHub rows never silently vanish.
+ *
  * Release selection deliberately does NOT use /releases/latest:
  * the moka-vpn repository carries a libtailscale AAR-cache release
  * whose tag is not a version, and that release holds "Latest".
@@ -30,13 +45,22 @@ import java.net.URL
  * primary one's metadata lives in update.json for now — other
  * files fall back to asset size + digest verification).
  *
- * All repositories are public; no token is used or needed.
+ * All repositories are public; no token is used or needed. The
+ * unauthenticated search API allows 10 requests/minute, far above
+ * this app's user-triggered refresh rate.
  */
 object GitHubSource {
 
+    /** Account whose `android`-topic repositories are watched. */
+    const val OWNER = "ysk-agent"
+    const val TOPIC = "android"
+
     /** APK file name -> "owner/repo" that publishes it as Release
-     *  assets. A file listed here gets a GitHub row whenever a
-     *  matching release is reachable, replacing its Drive row. */
+     *  assets. Since v0.1.12 this map is the FALLBACK, used only
+     *  when topic discovery fails or finds nothing; discovery is
+     *  the primary source. A file listed here gets a GitHub row
+     *  whenever a matching release is reachable, replacing its
+     *  Drive row. */
     val FILE_REPO: Map<String, String> = mapOf(
         "mokavpn.apk" to "ysk-agent/moka-vpn",
         "apps-updater.apk" to "ysk-agent/apps-updater",
@@ -57,12 +81,95 @@ object GitHubSource {
      *  once; selection per file happens against it. */
     private val releasesCache = mutableMapOf<String, JSONArray?>()
 
-    /** The GitHub-sourced item for [fileName], or null when the
-     *  file is not a known release artifact, no qualifying release
-     *  carries it, or GitHub is unreachable (callers then keep the
-     *  Drive row). */
+    /** Every GitHub-sourced item for one scan: topic discovery
+     *  first, the hardcoded [FILE_REPO] map as fallback when
+     *  discovery fails or returns no repositories. */
+    fun fetchAll(): List<ApkItem> {
+        val repos = discoverRepos()
+        if (repos.isNullOrEmpty()) {
+            return FILE_REPO.keys.mapNotNull { fileName ->
+                try {
+                    fetchItem(fileName)
+                } catch (e: Exception) {
+                    null
+                }
+            }
+        }
+        val items = mutableListOf<ApkItem>()
+        for (repo in repos) {
+            try {
+                items += fetchRepoItems(repo)
+            } catch (e: Exception) {
+                // One bad repository must not sink the whole scan.
+            }
+        }
+        return items
+    }
+
+    /** The repositories carrying the watched topic, as
+     *  "owner/repo" strings, or null when the search could not be
+     *  completed or parsed (the caller then falls back). An empty
+     *  list is returned as-is; the caller treats it like failure,
+     *  because a healthy account always has tagged repositories. */
+    private fun discoverRepos(): List<String>? {
+        val query = URLEncoder.encode("user:$OWNER topic:$TOPIC", "UTF-8")
+        val text = httpGetText(
+            "https://api.github.com/search/repositories?q=$query&per_page=100"
+        ) ?: return null
+        return try {
+            val items = JSONObject(text).optJSONArray("items") ?: return null
+            val repos = mutableListOf<String>()
+            for (i in 0 until items.length()) {
+                val fullName = items.optJSONObject(i)?.optString("full_name")
+                if (!fullName.isNullOrEmpty()) repos += fullName
+            }
+            repos
+        } catch (e: Exception) {
+            null
+        }
+    }
+
+    /** Every APK row one repository publishes: the `.apk` asset
+     *  names across its qualifying releases, each resolved to the
+     *  highest qualifying version that carries it. */
+    private fun fetchRepoItems(repo: String): List<ApkItem> {
+        val releases = releasesFor(repo) ?: return emptyList()
+        val fileNames = linkedSetOf<String>()
+        for (i in 0 until releases.length()) {
+            val release = releases.optJSONObject(i) ?: continue
+            if (!isQualifying(release)) continue
+            val assets = release.optJSONArray("assets") ?: continue
+            for (j in 0 until assets.length()) {
+                val name = assets.optJSONObject(j)?.optString("name") ?: continue
+                if (name.endsWith(".apk", ignoreCase = true)) fileNames += name
+            }
+        }
+        return fileNames.mapNotNull { fileName ->
+            try {
+                fetchItem(fileName, repo)
+            } catch (e: Exception) {
+                null
+            }
+        }
+    }
+
+    private fun isQualifying(release: JSONObject): Boolean {
+        if (release.optBoolean("draft") || release.optBoolean("prerelease")) return false
+        return VERSION_TAG.matches(release.optString("tag_name"))
+    }
+
+    /** The GitHub-sourced item for [fileName] published by the
+     *  repository in [FILE_REPO], or null when the file is not a
+     *  known release artifact. Used by the fallback path. */
     fun fetchItem(fileName: String): ApkItem? {
         val repo = FILE_REPO[fileName] ?: return null
+        return fetchItem(fileName, repo)
+    }
+
+    /** The GitHub-sourced item for [fileName] in [repo], or null
+     *  when no qualifying release carries it or GitHub is
+     *  unreachable (callers then keep the Drive row). */
+    private fun fetchItem(fileName: String, repo: String): ApkItem? {
         val releases = releasesFor(repo) ?: return null
 
         var best: JSONObject? = null

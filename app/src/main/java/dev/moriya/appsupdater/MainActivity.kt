@@ -312,18 +312,19 @@ class MainActivity : Activity() {
                 }
             }
             // GitHub Releases source (pilot for moka-vpn in v0.1.8,
-            // generalised in v0.1.9): for every file with a known
-            // publishing repo, an available GitHub row replaces the
-            // Drive row for the same file — the provider's view of
-            // those folders is exactly what cannot be trusted. When
-            // GitHub cannot be reached, the Drive row stays as the
-            // fallback.
-            val githubItems = GitHubSource.FILE_REPO.keys.mapNotNull { fileName ->
-                try {
-                    GitHubSource.fetchItem(fileName)
-                } catch (e: Exception) {
-                    null
-                }
+            // generalised in v0.1.9, topic discovery in v0.1.12):
+            // repositories carrying the `android` topic are
+            // discovered at scan time and every APK they publish
+            // gets a row, replacing the Drive row for the same
+            // file — the provider's view of those folders is
+            // exactly what cannot be trusted. The hardcoded map
+            // inside GitHubSource remains as the fallback for when
+            // discovery itself fails. When GitHub cannot be
+            // reached at all, the Drive row stays as the fallback.
+            val githubItems = try {
+                GitHubSource.fetchAll()
+            } catch (e: Exception) {
+                emptyList()
             }
             val githubFiles = githubItems.map { it.fileName.lowercase() }.toSet()
             val items = (
