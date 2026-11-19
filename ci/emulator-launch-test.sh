@@ -218,8 +218,20 @@ if [ -z "$BLOCKED" ]; then
 fi
 echo "failure-path block method: ${BLOCKED:-none}"
 if [ -n "$BLOCKED" ]; then
+  # Relaunch (onNewIntent re-runs the scan), then wait for the
+  # scan to actually finish before dumping the UI: under airplane
+  # mode the blocked requests hang until their timeouts (~13 s
+  # observed), so a fixed sleep races the render. The scan logs
+  # one "scan total" line under UpdaterTiming when it lands.
+  SCANS_BEFORE=$(adb logcat -d -s UpdaterTiming 2>/dev/null | grep -c "scan total")
   adb shell am start -n $PKG/.MainActivity >/dev/null 2>&1
-  sleep 10
+  for i in $(seq 1 24); do
+    SCANS_NOW=$(adb logcat -d -s UpdaterTiming 2>/dev/null | grep -c "scan total")
+    if [ "$SCANS_NOW" -gt "$SCANS_BEFORE" ]; then break; fi
+    sleep 5
+  done
+  echo "scan total lines before/after blocked relaunch: $SCANS_BEFORE -> $SCANS_NOW"
+  sleep 2
   adb shell uiautomator dump /sdcard/window_dump_fail.xml >/dev/null 2>&1 || true
   adb pull /sdcard/window_dump_fail.xml window_dump_fail.xml >/dev/null 2>&1 || true
   if grep -q "更新に失敗しました" window_dump_fail.xml && \
