@@ -47,7 +47,8 @@ import java.util.concurrent.atomic.AtomicLong
  * whose tag is not a version, and that release holds "Latest".
  * Only tags of the form vX.Y.Z qualify, and among those the
  * highest version that actually carries the requested file wins.
- * A release's update.json asset is honoured only when it names
+ * A release's update.json — the asset, or the copy embedded in
+ * the release body (see below) — is honoured only when it names
  * the requested file (a release can carry several APKs; only the
  * primary one's metadata lives in update.json for now — other
  * files fall back to asset size + digest verification).
@@ -63,8 +64,17 @@ import java.util.concurrent.atomic.AtomicLong
  *    previous successful discovery persisted (see [fetchAll]):
  *    those fetches run while discovery is still in flight;
  *  - API requests carry Cache-Control: no-cache, so a refresh
- *    always reads the current state.
- * The request count per scan is unchanged by all three.
+ *    always reads the current state;
+ *  - the per-file update.json asset fetch is skipped whenever
+ *    the chosen release embeds the same content in its body
+ *    (marker line "<!-- update-json -->" + fenced json block):
+ *    a VM benchmark put the repos phase at a 3,427ms median with
+ *    those fetches vs 930ms releases-only, so this removes the
+ *    dominant remaining cost. Old releases without the marker
+ *    still fetch the asset.
+ * The first three measures leave the request count per scan
+ * unchanged; the fourth removes one request per published file
+ * whose release carries the embedded block.
  *
  * All repositories are public; no token is used or needed. The
  * unauthenticated search API allows 10 requests/minute, far above
@@ -92,6 +102,10 @@ object GitHubSource {
     )
 
     private val VERSION_TAG = Regex("""^v(\d+)\.(\d+)\.(\d+)$""")
+
+    /** Marker line that introduces the update.json block embedded
+     *  in a release body (see parseEmbeddedUpdate). */
+    private const val UPDATE_JSON_MARKER = "<!-- update-json -->"
 
     /** Parsed releases array per repo, cached for ONE scan only:
      *  several files can share a repo (phone-node), and re-listing
@@ -339,21 +353,47 @@ object GitHubSource {
         val assets = release.optJSONArray("assets") ?: return null
         val apkAsset = findAsset(assets, fileName) ?: return null
 
-        // update.json, when the release carries one AND it names
-        // this file, supplies the version metadata.
+        // Version metadata, cheapest source first. Publishers
+        // also embed the update.json content in the release body
+        // (a line containing only "<!-- update-json -->", followed
+        // by a fenced json block — see parseEmbeddedUpdate). When
+        // the chosen release carries that block it is parsed from
+        // the already-downloaded release record and the
+        // update.json asset is NOT fetched: a VM benchmark showed
+        // the per-file update.json fetch was the dominant
+        // remaining scan cost (repos phase median 3,427ms with the
+        // fetches vs 930ms releases-only). The embedded block is
+        // authoritative for the whole release: when it names a
+        // different file (phone-node's helper APK), this file
+        // simply gets no update.json metadata — the asset holds
+        // the same content by convention, so fetching it could
+        // never change the outcome — and verification falls back
+        // to the asset digest, as before. Only releases without a
+        // parseable marker block (published before the convention)
+        // fall back to fetching the update.json asset, exactly as
+        // before. Either way the metadata is honoured only when
+        // it names this file; the asset digest/size stay the
+        // verification source.
         var update: UpdateInfo? = null
-        val updateAsset = findAsset(assets, "update.json")
-        if (updateAsset != null) {
-            val url = updateAsset.optString("browser_download_url")
-            if (url.isNotEmpty()) {
-                // Accumulate update.json fetch time (atomic: this
-                // runs on several worker threads concurrently).
-                val updateJsonStart = Timing.now()
-                val text = httpGetText(url)
-                lastScanTimings.updateJsonMs.addAndGet(Timing.now() - updateJsonStart)
-                if (text != null) {
-                    val parsed = Store.parseUpdate(text)
-                    if (parsed != null && parsed.file == fileName) update = parsed
+        val embedded = parseEmbeddedUpdate(release.optString("body"))
+        if (embedded != null) {
+            Timing.logLine("github update.json embedded $repo")
+            if (embedded.file == fileName) update = embedded
+        } else {
+            val updateAsset = findAsset(assets, "update.json")
+            if (updateAsset != null) {
+                val url = updateAsset.optString("browser_download_url")
+                if (url.isNotEmpty()) {
+                    // Accumulate update.json fetch time (atomic:
+                    // this runs on several worker threads
+                    // concurrently).
+                    val updateJsonStart = Timing.now()
+                    val text = httpGetText(url)
+                    lastScanTimings.updateJsonMs.addAndGet(Timing.now() - updateJsonStart)
+                    if (text != null) {
+                        val parsed = Store.parseUpdate(text)
+                        if (parsed != null && parsed.file == fileName) update = parsed
+                    }
                 }
             }
         }
@@ -405,6 +445,27 @@ object GitHubSource {
             }
             return parsed
         }
+    }
+
+    /** The update.json content embedded in a release body, or
+     *  null when the body carries no marker block (or the block
+     *  does not parse — the caller then falls back to fetching
+     *  the update.json asset). Convention: a line containing only
+     *  [UPDATE_JSON_MARKER], followed by a fenced ```json block
+     *  holding the update.json object. */
+    private fun parseEmbeddedUpdate(body: String?): UpdateInfo? {
+        if (body.isNullOrEmpty()) return null
+        val markerAt = body.indexOf(UPDATE_JSON_MARKER)
+        if (markerAt < 0) return null
+        val fenceOpen = body.indexOf("```", markerAt + UPDATE_JSON_MARKER.length)
+        if (fenceOpen < 0) return null
+        val contentStart = body.indexOf('\n', fenceOpen)
+        if (contentStart < 0) return null
+        val fenceClose = body.indexOf("```", contentStart)
+        if (fenceClose < 0) return null
+        val json = body.substring(contentStart + 1, fenceClose).trim()
+        if (json.isEmpty()) return null
+        return Store.parseUpdate(json)
     }
 
     private fun findAsset(assets: JSONArray, name: String): JSONObject? {

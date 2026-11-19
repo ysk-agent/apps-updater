@@ -48,8 +48,14 @@ order), starts optimistically from the repository list persisted
 by the previous successful discovery (those fetches run while
 discovery is still in flight; discovery remains authoritative),
 and sends `Cache-Control: no-cache` on API requests so a refresh
-always reads the current state. The request count per scan is
-unchanged. The header keeps the last scan's timing summary
+always reads the current state. On top of that, publishers embed
+the `update.json` content in the release body (a line containing
+only `<!-- update-json -->`, followed by a fenced ```json block);
+when the chosen release carries that block the app parses the
+metadata from the body and never fetches the `update.json` asset
+(a VM benchmark put the repos phase at a 3,427 ms median with
+those fetches vs 930 ms releases-only). Releases without the
+marker still fetch the asset. The header keeps the last scan's timing summary
 (合計 / GitHub / ローカル) and every phase is logged to logcat
 under the `UpdaterTiming` tag.
 
