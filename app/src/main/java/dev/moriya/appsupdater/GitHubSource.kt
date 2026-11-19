@@ -5,6 +5,9 @@ import org.json.JSONObject
 import java.net.HttpURLConnection
 import java.net.URL
 import java.net.URLEncoder
+import java.util.concurrent.Callable
+import java.util.concurrent.Executors
+import java.util.concurrent.atomic.AtomicLong
 
 /**
  * GitHub Releases source (pilot in v0.1.8 for moka-vpn only,
@@ -82,12 +85,25 @@ object GitHubSource {
      *  arrays are stored, so a failed fetch never poisons a scan. */
     private val releasesCache = mutableMapOf<String, JSONArray>()
 
+    /** TEST BUILD (timing-test-2): one lock object per repo, so
+     *  concurrent workers fetching DIFFERENT repos never block
+     *  each other, while two workers asking for the SAME repo
+     *  serialise and the second one reuses the first's fetch
+     *  instead of issuing a duplicate request. Cleared with
+     *  [releasesCache] at the start of every scan. */
+    private val repoFetchLocks = mutableMapOf<String, Any>()
+
+    private fun repoFetchLock(repo: String): Any =
+        synchronized(repoFetchLocks) { repoFetchLocks.getOrPut(repo) { Any() } }
+
     /** TEST BUILD (timing-test): breakdown of the most recent
-     *  [fetchAll] scan. fetchAll and everything it calls run on a
-     *  single scan thread, so plain fields are safe here. */
+     *  [fetchAll] scan. [discoveryMs] and [totalMs] are written
+     *  only by the thread that called fetchAll. [updateJsonMs] is
+     *  accumulated from the per-repo worker threads (timing-test-2
+     *  fetches repositories concurrently), so it is atomic. */
     class ScanTimings {
         var discoveryMs: Long? = null
-        var updateJsonMs: Long = 0L
+        val updateJsonMs = AtomicLong(0L)
         var totalMs: Long? = null
     }
 
@@ -105,6 +121,7 @@ object GitHubSource {
         lastScanTimings = timings
         // Per-scan cache: every scan starts from fresh release lists.
         synchronized(releasesCache) { releasesCache.clear() }
+        synchronized(repoFetchLocks) { repoFetchLocks.clear() }
         val discoveryStart = Timing.now()
         val repos = discoverRepos()
         timings.discoveryMs = Timing.now() - discoveryStart
@@ -119,18 +136,41 @@ object GitHubSource {
                 }
             }
         } else {
-            val items = mutableListOf<ApkItem>()
-            for (repo in repos) {
-                try {
-                    items += fetchRepoItems(repo)
-                } catch (e: Exception) {
-                    // One bad repository must not sink the whole scan.
+            // TEST BUILD (timing-test-2): fetch the discovered
+            // repositories concurrently (bounded pool, 4 threads)
+            // instead of one after another — the sequential fetch
+            // was 90% of scan time in the timing-test-1 on-device
+            // measurement. Same requests per scan, same per-scan
+            // cache; futures are joined in discovery order, so the
+            // resulting item order is identical to the sequential
+            // version's.
+            val pool = Executors.newFixedThreadPool(4)
+            try {
+                val futures = repos.map { repo ->
+                    pool.submit(Callable<List<ApkItem>> {
+                        try {
+                            fetchRepoItems(repo)
+                        } catch (e: Exception) {
+                            // One bad repository must not sink the whole scan.
+                            emptyList()
+                        }
+                    })
                 }
+                val items = mutableListOf<ApkItem>()
+                for (future in futures) {
+                    try {
+                        items += future.get()
+                    } catch (e: Exception) {
+                        // One bad repository must not sink the whole scan.
+                    }
+                }
+                result = items
+            } finally {
+                pool.shutdown()
             }
-            result = items
         }
         timings.totalMs = Timing.now() - totalStart
-        Timing.log("github update.json total", timings.updateJsonMs)
+        Timing.log("github update.json total", timings.updateJsonMs.get())
         Timing.log("github total", timings.totalMs!!)
         return result
     }
@@ -231,10 +271,11 @@ object GitHubSource {
         if (updateAsset != null) {
             val url = updateAsset.optString("browser_download_url")
             if (url.isNotEmpty()) {
-                // TEST BUILD (timing-test): accumulate update.json fetch time.
+                // TEST BUILD (timing-test): accumulate update.json fetch time
+                // (atomic: timing-test-2 calls this from several threads).
                 val updateJsonStart = Timing.now()
                 val text = httpGetText(url)
-                lastScanTimings.updateJsonMs += Timing.now() - updateJsonStart
+                lastScanTimings.updateJsonMs.addAndGet(Timing.now() - updateJsonStart)
                 if (text != null) {
                     val parsed = Store.parseUpdate(text)
                     if (parsed != null && parsed.file == fileName) update = parsed
@@ -262,24 +303,34 @@ object GitHubSource {
         synchronized(releasesCache) {
             if (releasesCache.containsKey(repo)) return releasesCache[repo]
         }
-        // TEST BUILD (timing-test): only real fetches are timed;
-        // per-scan cache hits return above without a log line.
-        val fetchStart = Timing.now()
-        val text = httpGetText("https://api.github.com/repos/$repo/releases?per_page=30")
-        val parsed = text?.let {
-            try {
-                JSONArray(it)
-            } catch (e: Exception) {
-                null
+        // TEST BUILD (timing-test-2): serialise on this repo's own
+        // lock only. Different repos fetch in parallel; a second
+        // caller for the same repo waits, then re-checks the cache
+        // and reuses the first caller's result — the releases list
+        // is never fetched twice for one repo in one scan.
+        synchronized(repoFetchLock(repo)) {
+            synchronized(releasesCache) {
+                if (releasesCache.containsKey(repo)) return releasesCache[repo]
             }
+            // TEST BUILD (timing-test): only real fetches are timed;
+            // per-scan cache hits return above without a log line.
+            val fetchStart = Timing.now()
+            val text = httpGetText("https://api.github.com/repos/$repo/releases?per_page=30")
+            val parsed = text?.let {
+                try {
+                    JSONArray(it)
+                } catch (e: Exception) {
+                    null
+                }
+            }
+            Timing.log("github releases $repo", Timing.now() - fetchStart)
+            // Cache only successful parses: a failed fetch must not
+            // poison the rest of this scan (or any later one).
+            if (parsed != null) {
+                synchronized(releasesCache) { releasesCache[repo] = parsed }
+            }
+            return parsed
         }
-        Timing.log("github releases $repo", Timing.now() - fetchStart)
-        // Cache only successful parses: a failed fetch must not
-        // poison the rest of this scan (or any later one).
-        if (parsed != null) {
-            synchronized(releasesCache) { releasesCache[repo] = parsed }
-        }
-        return parsed
     }
 
     private fun findAsset(assets: JSONArray, name: String): JSONObject? {
