@@ -13,9 +13,14 @@ import org.json.JSONArray
 import org.json.JSONObject
 import java.io.File
 import java.io.InputStream
+import java.io.RandomAccessFile
 import java.net.HttpURLConnection
 import java.net.URL
 import java.security.MessageDigest
+import java.util.concurrent.Executors
+import java.util.concurrent.atomic.AtomicBoolean
+import java.util.concurrent.atomic.AtomicLong
+import java.util.concurrent.atomic.AtomicReference
 
 /** One APK offered by the GitHub Releases source (the only
  * source since v0.2.0; the Drive/SAF source was removed).
@@ -377,30 +382,192 @@ object Store {
      * the Drive era: a stale file left in place after a reported
      * mismatch could later be installed as if it were the update.)
      */
+    // -- parallel (segmented) download --------------------------------------
+    //
+    // A single HTTPS stream from the GitHub release-asset host to a
+    // phone in Japan plateaus far below the line's capacity
+    // (observed 2026-11-21: ~7 MB/s on a line fast.com measures at
+    // ~250 Mbps): one TCP flow over a long-RTT path cannot fill the
+    // pipe. The scan was parallelised in v0.2.0, but the asset
+    // download itself stayed single-stream until v0.2.3. Assets are
+    // now fetched as Range segments on several connections at once
+    // (the same asset host already answers Range requests — the
+    // package probe in PackageProbe relies on exactly that). Any
+    // failure in the parallel path (no Range support, a short or
+    // failed segment) falls back to the original single stream, so
+    // a server quirk can never make a download impossible, only
+    // slower. The SHA-256 check afterwards is unchanged and covers
+    // the reassembled bytes either way.
+
+    private const val PARALLEL_MIN_BYTES = 4L * 1024 * 1024
+    private const val PARALLEL_MAX_SEGMENTS = 8
+    private const val PARALLEL_TARGET_SEGMENT = 2L * 1024 * 1024
+
+    /** Number of segments for [total] bytes, or 0 when the file is
+     *  too small for parallel fetching to pay off. */
+    private fun parallelSegments(total: Long): Int {
+        if (total < PARALLEL_MIN_BYTES) return 0
+        val bySize = (total + PARALLEL_TARGET_SEGMENT - 1) / PARALLEL_TARGET_SEGMENT
+        return bySize.coerceIn(2, PARALLEL_MAX_SEGMENTS.toLong()).toInt()
+    }
+
+    /**
+     * Fetch one byte range [start, end] of [startUrl] into [file] at
+     * offset [start], following redirects manually (each redirect
+     * must re-carry the Range header; HttpURLConnection's automatic
+     * following does not guarantee that). Returns false when the
+     * server answers 200 instead of 206 (Range ignored) or the
+     * segment arrives short — the caller then falls back.
+     */
+    private fun fetchSegment(
+        file: File, startUrl: String, start: Long, end: Long,
+        onChunk: (Int) -> Unit
+    ): Boolean {
+        var url = startUrl
+        var redirects = 0
+        while (true) {
+            var conn: HttpURLConnection? = null
+            try {
+                conn = (URL(url).openConnection() as HttpURLConnection).apply {
+                    requestMethod = "GET"
+                    connectTimeout = 15_000
+                    readTimeout = 120_000
+                    instanceFollowRedirects = false
+                    setRequestProperty("User-Agent", "AppsUpdater")
+                    setRequestProperty("Accept", "application/octet-stream")
+                    setRequestProperty("Cache-Control", "no-cache")
+                    setRequestProperty("Range", "bytes=$start-$end")
+                }
+                when (val code = conn.responseCode) {
+                    in 300..399 -> {
+                        val location = conn.getHeaderField("Location") ?: return false
+                        if (++redirects > 5) return false
+                        url = URL(URL(url), location).toString()
+                    }
+                    206 -> {
+                        val want = end - start + 1
+                        var got = 0L
+                        RandomAccessFile(file, "rw").use { raf ->
+                            raf.seek(start)
+                            conn.inputStream.use { input ->
+                                val buf = ByteArray(256 * 1024)
+                                while (got < want) {
+                                    val n = input.read(
+                                        buf, 0, minOf(buf.size.toLong(), want - got).toInt()
+                                    )
+                                    if (n < 0) break
+                                    raf.write(buf, 0, n)
+                                    got += n
+                                    onChunk(n)
+                                }
+                            }
+                        }
+                        return got == want
+                    }
+                    else -> return false
+                }
+            } catch (e: Exception) {
+                return false
+            } finally {
+                conn?.disconnect()
+            }
+        }
+    }
+
+    /**
+     * Download [item] into [tmp] as parallel Range segments.
+     * Returns the total byte count on success, or null when the
+     * parallel path does not apply or any segment failed (the
+     * caller then retries single-stream; [tmp] may hold partial
+     * bytes and is truncated by that retry).
+     */
+    private fun downloadParallel(
+        tmp: File, item: ApkItem, onProgress: (Long, Long) -> Unit
+    ): Long? {
+        val total = item.size
+        val url = item.downloadUrl ?: return null
+        val segments = parallelSegments(total)
+        if (segments == 0) return null
+        val started = Timing.now()
+        RandomAccessFile(tmp, "rw").use { it.setLength(total) }
+        val progress = AtomicLong(0)
+        val failed = AtomicBoolean(false)
+        val firstError = AtomicReference<String?>(null)
+        val progressLock = Any()
+        val segSize = (total + segments - 1) / segments
+        val pool = Executors.newFixedThreadPool(segments)
+        try {
+            val futures = (0 until segments).map { i ->
+                val start = i * segSize
+                val end = minOf(start + segSize, total) - 1
+                pool.submit<Boolean> {
+                    val ok = fetchSegment(tmp, url, start, end) { n ->
+                        val now = progress.addAndGet(n.toLong())
+                        synchronized(progressLock) { onProgress(now, total) }
+                    }
+                    if (!ok) {
+                        failed.set(true)
+                        firstError.compareAndSet(null, "segment $i ($start-$end)")
+                    }
+                    ok
+                }
+            }
+            futures.forEach { it.get() }
+        } catch (e: Exception) {
+            failed.set(true)
+            firstError.compareAndSet(null, e.javaClass.simpleName)
+        } finally {
+            pool.shutdownNow()
+        }
+        val ms = Timing.now() - started
+        if (failed.get() || progress.get() != total) {
+            Timing.logLine(
+                "download ${item.fileName}: parallel segments=$segments failed " +
+                    "(${firstError.get()}, ${progress.get()}/$total B, ${ms}ms); falling back to single stream"
+            )
+            return null
+        }
+        Timing.logLine(
+            "download ${item.fileName}: parallel segments=$segments ok ($total B, ${ms}ms)"
+        )
+        return total
+    }
+
     fun download(context: Context, item: ApkItem, onProgress: (Long, Long) -> Unit): DownloadResult {
         val target = downloadedFile(context, item.fileName)
         val tmp = File(target.parentFile, item.fileName + ".part")
-        val digest = MessageDigest.getInstance("SHA-256")
         var copied = 0L
-        openItemStream(context, item)?.use { input ->
-            tmp.outputStream().use { output ->
-                val buf = ByteArray(256 * 1024)
-                while (true) {
-                    val n = input.read(buf)
-                    if (n < 0) break
-                    output.write(buf, 0, n)
-                    digest.update(buf, 0, n)
-                    copied += n
-                    onProgress(copied, item.size)
+        var sha: String
+        val parallelBytes = downloadParallel(tmp, item, onProgress)
+        if (parallelBytes != null) {
+            copied = parallelBytes
+            // Segments were written by offset, so no digest could
+            // be accumulated in order on the way; hash the
+            // reassembled file (a local read, far faster than the
+            // network path it replaces).
+            sha = sha256Of(tmp)
+        } else {
+            val digest = MessageDigest.getInstance("SHA-256")
+            openItemStream(context, item)?.use { input ->
+                tmp.outputStream().use { output ->
+                    val buf = ByteArray(256 * 1024)
+                    while (true) {
+                        val n = input.read(buf)
+                        if (n < 0) break
+                        output.write(buf, 0, n)
+                        digest.update(buf, 0, n)
+                        copied += n
+                        onProgress(copied, item.size)
+                    }
                 }
-            }
-        } ?: throw IllegalStateException("APK を開けませんでした")
+            } ?: throw IllegalStateException("APK を開けませんでした")
+            sha = digest.digest().joinToString("") { "%02x".format(it) }
+        }
         if (target.exists()) target.delete()
         if (!tmp.renameTo(target)) {
             tmp.copyTo(target, overwrite = true)
             tmp.delete()
         }
-        val sha = digest.digest().joinToString("") { "%02x".format(it) }
         // The expectation is the release asset's digest from the
         // GitHub API; it is carried both as the item's assetDigest
         // and as its update.sha256 (synthesized from the same

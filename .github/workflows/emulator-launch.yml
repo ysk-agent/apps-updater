@@ -72,6 +72,7 @@ jobs:
           path: |
             logcat.txt
             probe-logcat.txt
+            download-logcat.txt
             dumpsys-activities.txt
             window_dump.xml
             window_dump_fail.xml

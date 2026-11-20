@@ -132,7 +132,11 @@ TEST_SIZE=$(stat -c%s ci-test-assets/ci-test.apk)
 # keeps the emulator-runner step open indefinitely — the first
 # v0.1.9 run passed every check in ~10 seconds and then hung the
 # step for 50 minutes on exactly this.
-python3 -m http.server 8123 --directory ci-test-assets >/dev/null 2>&1 &
+# Range-capable server (ci/range_server.py), not http.server:
+# http.server ignores Range and would send the app down its
+# single-stream fallback, leaving the v0.2.3 parallel path
+# unexercised. The 8 MiB payload is fetched as 4 segments.
+python3 ci/range_server.py 8123 ci-test-assets >/dev/null 2>&1 &
 HTTP_PID=$!
 sleep 1
 
@@ -152,6 +156,17 @@ if [ "$DL_OK" = 1 ]; then
   echo "OK: foreground-service download produced the done marker"
 else
   note_fail "foreground-service download did not produce the done marker within 60s"
+fi
+# Parallel-path evidence (v0.2.3): the download must have used
+# Range segments, not the single-stream fallback. Store logs one
+# "download <file>: parallel segments=<n> ok" line per parallel
+# download under UpdaterTiming.
+adb logcat -d -s UpdaterTiming > download-logcat.txt 2>&1 || true
+cat download-logcat.txt
+if grep -q "download ci-test.apk: parallel segments=4 ok" download-logcat.txt; then
+  echo "OK: download used the parallel segmented path (4 segments)"
+else
+  note_fail "download did not use the parallel segmented path (see download-logcat.txt)"
 fi
 adb pull /sdcard/Download/apps-updater/ci-test.apk ci-test-downloaded.apk >/dev/null 2>&1 || true
 GOT_SHA=$(sha256sum ci-test-downloaded.apk 2>/dev/null | cut -d' ' -f1)

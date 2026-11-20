@@ -105,6 +105,23 @@ the done marker, the published bytes' SHA-256, and that a
 mismatched download is discarded with no marker and no published
 file.
 
+## Parallel downloads (v0.2.3)
+
+A single HTTPS stream from the release-asset host plateaus far
+below the line's capacity (observed on a real device: ~7 MB/s on
+a line measured at ~250 Mbps), because one TCP flow over a
+long-RTT path cannot fill the pipe. Downloads of 4 MiB or more
+are therefore split into Range segments (about 2 MiB each, at
+most 8 connections) fetched in parallel and reassembled by
+offset; the SHA-256 is then computed over the reassembled file
+and verified exactly as before. Any segment failure — or a
+server that ignores Range — falls back to the original single
+stream, so parallel support can only make a download faster,
+never impossible. Each download logs its mode and segment count
+under the `UpdaterTiming` tag, and the CI emulator test serves
+its payload through a Range-capable server (`ci/range_server.py`)
+and asserts the parallel path was actually used.
+
 ## How it works
 
 - One-time setup on the device: none for listing. Allow
