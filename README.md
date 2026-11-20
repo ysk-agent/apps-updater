@@ -237,3 +237,11 @@ same gateway at ~36 MB/s single-flow. The bottleneck was the
 transport, not the network and not the flow count. The scan /
 GitHub API path still uses `HttpURLConnection` (small JSON,
 unaffected). Segmented parallel download from v0.2.3 is kept.
+
+## Download transport experiment (v0.2.5)
+
+v0.2.4's OkHttp measured the same ~4 MB/s plateau on the
+device, so v0.2.5 moves the download path to Cronet (Chromium's
+network stack via Play services) — the stack Chrome itself
+uses, which measured ~21 MB/s for the same asset on the same
+phone. Segmented parallel download is kept on top of it.

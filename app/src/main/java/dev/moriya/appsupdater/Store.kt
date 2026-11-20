@@ -12,13 +12,15 @@ import android.provider.MediaStore
 import org.json.JSONArray
 import org.json.JSONObject
 import java.io.File
-import java.io.InputStream
 import java.io.RandomAccessFile
+import java.nio.ByteBuffer
 import java.security.MessageDigest
+import java.util.concurrent.CountDownLatch
 import java.util.concurrent.Executors
-import java.util.concurrent.TimeUnit
-import okhttp3.OkHttpClient
-import okhttp3.Request
+import org.chromium.net.CronetEngine
+import org.chromium.net.CronetException
+import org.chromium.net.UrlRequest
+import org.chromium.net.UrlResponseInfo
 import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicLong
 import java.util.concurrent.atomic.AtomicReference
@@ -293,46 +295,116 @@ object Store {
     // the byte path: an HTTPS stream of the release asset.
 
     /**
-     * HTTP client for the asset download path (v0.2.4).
+     * HTTP transport for the asset download path (v0.2.5):
+     * Cronet, the Chromium network stack, provided by Google
+     * Play services.
      *
-     * Until v0.2.3 downloads ran on the platform HttpURLConnection
-     * stack. On the user's moto g05 that stack plateaued at
-     * ~5 MB/s for release assets — single-stream and 8-way
-     * parallel alike, CPU idle, on a WiFi link negotiated at
-     * 390 Mbps — while Chrome (Cronet) pulled the same asset at
-     * ~21 MB/s on the same phone in the same minutes, and a wired
-     * Mac on the same gateway pulled it at ~36 MB/s single-flow.
-     * The network was never the bottleneck; the transport was.
-     * OkHttp brings its own connection/buffer management and
-     * HTTP/2, which is the closest available equivalent of the
-     * browser stack. If a future measurement shows this made no
-     * difference, the remaining candidate is Cronet itself.
+     * Why: on the user's moto g05, both the platform
+     * HttpURLConnection stack (v0.2.3 and earlier) and OkHttp
+     * (v0.2.4) plateaued at ~4–5 MB/s for release assets —
+     * single-stream and 8-way parallel alike, app CPU idle, on a
+     * WiFi link negotiated at 390 Mbps with storage writing at
+     * 746 MB/s — while Chrome pulled the same asset at ~21 MB/s
+     * on the same phone in the same minutes, and a wired Mac on
+     * the same gateway reached 18–56 MB/s. The bottleneck was
+     * neither the network nor the flow count nor the HTTP
+     * library's Java layer; what Chrome has that the Java stacks
+     * do not is Cronet itself (QUIC, BBR, its own socket tuning),
+     * so the download path now runs on Cronet. The scan / GitHub
+     * API path still uses HttpURLConnection (small JSON,
+     * unaffected).
      */
-    private val downloadClient: OkHttpClient = OkHttpClient.Builder()
-        .connectTimeout(15, TimeUnit.SECONDS)
-        .readTimeout(120, TimeUnit.SECONDS)
-        .build()
+    @Volatile private var cronetEngine: CronetEngine? = null
 
-    private fun assetRequest(url: String, range: String? = null): Request {
-        val builder = Request.Builder()
-            .url(url)
-            .header("User-Agent", "AppsUpdater")
-            .header("Accept", "application/octet-stream")
-            .header("Cache-Control", "no-cache")
-        if (range != null) builder.header("Range", range)
-        return builder.build()
+    private fun cronet(context: Context): CronetEngine {
+        cronetEngine?.let { return it }
+        synchronized(this) {
+            cronetEngine?.let { return it }
+            val engine = CronetEngine.Builder(context.applicationContext)
+                .enableHttp2(true)
+                .enableQuic(true)
+                .build()
+            cronetEngine = engine
+            return engine
+        }
     }
 
-    /** Stream for one item: the release asset over HTTPS. */
-    private fun openItemStream(context: Context, item: ApkItem): InputStream? {
-        val url = item.downloadUrl ?: return null
-        val response = downloadClient.newCall(assetRequest(url)).execute()
-        if (!response.isSuccessful) {
-            val code = response.code
-            response.close()
-            throw IllegalStateException("GitHub から取得できませんでした (HTTP $code)")
+    /**
+     * Perform one GET through Cronet, delivering body chunks to
+     * [sink] in order on a single callback thread, blocking the
+     * caller until the request finishes. Returns the HTTP status
+     * code; throws on transport failure (including a [sink]
+     * exception, which cancels the request).
+     */
+    private fun cronetGet(
+        context: Context, url: String, range: String?,
+        sink: (ByteArray, Int) -> Unit
+    ): Int {
+        val latch = CountDownLatch(1)
+        val status = AtomicLong(-1)
+        val failure = AtomicReference<Exception?>(null)
+        val callback = object : UrlRequest.Callback() {
+            override fun onRedirectReceived(
+                request: UrlRequest, info: UrlResponseInfo, newLocationUrl: String
+            ) {
+                request.followRedirect()
+            }
+
+            override fun onResponseStarted(request: UrlRequest, info: UrlResponseInfo) {
+                status.set(info.httpStatusCode.toLong())
+                request.read(ByteBuffer.allocateDirect(256 * 1024))
+            }
+
+            override fun onReadCompleted(
+                request: UrlRequest, info: UrlResponseInfo, buffer: ByteBuffer
+            ) {
+                try {
+                    buffer.flip()
+                    val n = buffer.remaining()
+                    if (n > 0) {
+                        val bytes = ByteArray(n)
+                        buffer.get(bytes)
+                        sink(bytes, n)
+                    }
+                    buffer.clear()
+                    request.read(buffer)
+                } catch (e: Exception) {
+                    failure.compareAndSet(null, e)
+                    request.cancel()
+                    latch.countDown()
+                }
+            }
+
+            override fun onSucceeded(request: UrlRequest, info: UrlResponseInfo) {
+                latch.countDown()
+            }
+
+            override fun onFailed(
+                request: UrlRequest, info: UrlResponseInfo?, error: CronetException
+            ) {
+                failure.compareAndSet(null, error)
+                latch.countDown()
+            }
+
+            override fun onCanceled(request: UrlRequest, info: UrlResponseInfo?) {
+                latch.countDown()
+            }
         }
-        return response.body?.byteStream()
+        val executor = Executors.newSingleThreadExecutor()
+        try {
+            val builder = cronet(context).newUrlRequestBuilder(url, callback, executor)
+                .setHttpMethod("GET")
+                .addHeader("User-Agent", "AppsUpdater")
+                .addHeader("Accept", "application/octet-stream")
+                .addHeader("Cache-Control", "no-cache")
+            if (range != null) builder.addHeader("Range", range)
+            builder.build().start()
+            latch.await()
+        } finally {
+            executor.shutdown()
+        }
+        failure.get()?.let { throw it }
+        return status.get().toInt()
     }
 
     // -- package info -------------------------------------------------------
@@ -437,39 +509,25 @@ object Store {
 
     /**
      * Fetch one byte range [start, end] of [url] into [file] at
-     * offset [start]. OkHttp follows redirects itself and re-sends
-     * the Range header on redirect (it only strips Authorization),
-     * which the manual redirect loop in the HttpURLConnection era
-     * had to do by hand. Returns false when the server answers
-     * 200 instead of 206 (Range ignored) or the segment arrives
-     * short — the caller then falls back.
+     * offset [start] through Cronet (redirects are followed by
+     * the callback, re-carrying the Range header). Returns false
+     * when the server answers 200 instead of 206 (Range ignored)
+     * or the segment arrives short — the caller then falls back.
      */
     private fun fetchSegment(
-        file: File, url: String, start: Long, end: Long,
+        context: Context, file: File, url: String, start: Long, end: Long,
         onChunk: (Int) -> Unit
     ): Boolean {
         return try {
-            downloadClient.newCall(assetRequest(url, "bytes=$start-$end")).execute().use { response ->
-                if (response.code != 206) return false
-                val input = response.body?.byteStream() ?: return false
-                val want = end - start + 1
-                var got = 0L
-                RandomAccessFile(file, "rw").use { raf ->
-                    raf.seek(start)
-                    input.use { stream ->
-                        val buf = ByteArray(256 * 1024)
-                        while (got < want) {
-                            val n = stream.read(
-                                buf, 0, minOf(buf.size.toLong(), want - got).toInt()
-                            )
-                            if (n < 0) break
-                            raf.write(buf, 0, n)
-                            got += n
-                            onChunk(n)
-                        }
-                    }
+            var got = 0L
+            RandomAccessFile(file, "rw").use { raf ->
+                raf.seek(start)
+                val code = cronetGet(context, url, "bytes=$start-$end") { bytes, n ->
+                    raf.write(bytes, 0, n)
+                    got += n
+                    onChunk(n)
                 }
-                got == want
+                code == 206 && got == end - start + 1
             }
         } catch (e: Exception) {
             false
@@ -484,7 +542,7 @@ object Store {
      * bytes and is truncated by that retry).
      */
     private fun downloadParallel(
-        tmp: File, item: ApkItem, onProgress: (Long, Long) -> Unit
+        context: Context, tmp: File, item: ApkItem, onProgress: (Long, Long) -> Unit
     ): Long? {
         val total = item.size
         val url = item.downloadUrl ?: return null
@@ -503,7 +561,7 @@ object Store {
                 val start = i * segSize
                 val end = minOf(start + segSize, total) - 1
                 pool.submit<Boolean> {
-                    val ok = fetchSegment(tmp, url, start, end) { n ->
+                    val ok = fetchSegment(context, tmp, url, start, end) { n ->
                         val now = progress.addAndGet(n.toLong())
                         synchronized(progressLock) { onProgress(now, total) }
                     }
@@ -540,7 +598,7 @@ object Store {
         val tmp = File(target.parentFile, item.fileName + ".part")
         var copied = 0L
         var sha: String
-        val parallelBytes = downloadParallel(tmp, item, onProgress)
+        val parallelBytes = downloadParallel(context, tmp, item, onProgress)
         if (parallelBytes != null) {
             copied = parallelBytes
             // Segments were written by offset, so no digest could
@@ -549,20 +607,20 @@ object Store {
             // network path it replaces).
             sha = sha256Of(tmp)
         } else {
+            val url = item.downloadUrl
+                ?: throw IllegalStateException("APK を開けませんでした")
             val digest = MessageDigest.getInstance("SHA-256")
-            openItemStream(context, item)?.use { input ->
-                tmp.outputStream().use { output ->
-                    val buf = ByteArray(256 * 1024)
-                    while (true) {
-                        val n = input.read(buf)
-                        if (n < 0) break
-                        output.write(buf, 0, n)
-                        digest.update(buf, 0, n)
-                        copied += n
-                        onProgress(copied, item.size)
-                    }
+            tmp.outputStream().use { output ->
+                val code = cronetGet(context, url, null) { bytes, n ->
+                    output.write(bytes, 0, n)
+                    digest.update(bytes, 0, n)
+                    copied += n
+                    onProgress(copied, item.size)
                 }
-            } ?: throw IllegalStateException("APK を開けませんでした")
+                if (code !in 200..299) {
+                    throw IllegalStateException("GitHub から取得できませんでした (HTTP $code)")
+                }
+            }
             sha = digest.digest().joinToString("") { "%02x".format(it) }
         }
         if (target.exists()) target.delete()

@@ -11,8 +11,8 @@ android {
         applicationId = "dev.moriya.appsupdater"
         minSdk = 29
         targetSdk = 34
-        versionCode = 19
-        versionName = "0.2.4"
+        versionCode = 20
+        versionName = "0.2.5"
     }
 
     // Pinned signing key, same pattern as yt-player / phone-node-waker:
@@ -50,14 +50,18 @@ android {
     }
 }
 
-// The app was framework-APIs-only until v0.2.3. v0.2.4 adds
-// OkHttp for the asset download path only: on a real device the
-// platform HttpURLConnection stack plateaued at ~5 MB/s for
-// release assets (single and 8-way parallel alike) while Chrome
-// pulled the same asset at ~21 MB/s on the same phone and WiFi,
-// so the transport, not the network, was the bottleneck. The
-// scan/API path keeps using HttpURLConnection (small JSON,
-// unaffected).
+// The app was framework-APIs-only until v0.2.3. v0.2.4 tried
+// OkHttp for the download path; v0.2.5 uses Cronet (the Chromium
+// network stack, provided by Google Play services) instead.
+// Measured on the user's moto g05 (2026-11-21): both the platform
+// HttpURLConnection stack and OkHttp plateau at ~4–5 MB/s for
+// release assets — single-stream and 8-way parallel alike, app
+// CPU idle, WiFi negotiated at 390 Mbps — while Chrome pulled
+// the same asset at ~21 MB/s on the same phone in the same
+// minutes and a wired Mac on the same gateway at 18–56 MB/s.
+// The difference is the browser's own stack (QUIC/BBR/socket
+// tuning), so the download path now uses that same stack. The
+// scan/API path keeps HttpURLConnection (small JSON, unaffected).
 dependencies {
-    implementation("com.squareup.okhttp3:okhttp:4.12.0")
+    implementation("com.google.android.gms:play-services-cronet:18.1.1")
 }
