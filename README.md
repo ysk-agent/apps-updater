@@ -224,3 +224,16 @@ so every build overwrite-installs over the previous one. The fixed
 distribution file name is `apps-updater.apk`, published as a
 GitHub Release asset together with its `update.json`. CI also
 runs an emulator launch test with screenshots of the main screen.
+
+## Download transport (v0.2.4)
+
+Downloads moved from the platform `HttpURLConnection` stack to
+OkHttp. Measured on the user's moto g05 (2026-11-21): the old
+stack plateaued at ~5 MB/s for release assets — single-stream
+and 8-way parallel alike, app CPU idle, WiFi negotiated at
+390 Mbps, storage writing at 746 MB/s — while Chrome pulled the
+same asset at ~21 MB/s on the same phone and a wired Mac on the
+same gateway at ~36 MB/s single-flow. The bottleneck was the
+transport, not the network and not the flow count. The scan /
+GitHub API path still uses `HttpURLConnection` (small JSON,
+unaffected). Segmented parallel download from v0.2.3 is kept.

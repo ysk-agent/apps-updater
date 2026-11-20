@@ -14,10 +14,11 @@ import org.json.JSONObject
 import java.io.File
 import java.io.InputStream
 import java.io.RandomAccessFile
-import java.net.HttpURLConnection
-import java.net.URL
 import java.security.MessageDigest
 import java.util.concurrent.Executors
+import java.util.concurrent.TimeUnit
+import okhttp3.OkHttpClient
+import okhttp3.Request
 import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicLong
 import java.util.concurrent.atomic.AtomicReference
@@ -291,24 +292,47 @@ object Store {
     // Producing the rows lives in GitHubSource. What stays here is
     // the byte path: an HTTPS stream of the release asset.
 
+    /**
+     * HTTP client for the asset download path (v0.2.4).
+     *
+     * Until v0.2.3 downloads ran on the platform HttpURLConnection
+     * stack. On the user's moto g05 that stack plateaued at
+     * ~5 MB/s for release assets — single-stream and 8-way
+     * parallel alike, CPU idle, on a WiFi link negotiated at
+     * 390 Mbps — while Chrome (Cronet) pulled the same asset at
+     * ~21 MB/s on the same phone in the same minutes, and a wired
+     * Mac on the same gateway pulled it at ~36 MB/s single-flow.
+     * The network was never the bottleneck; the transport was.
+     * OkHttp brings its own connection/buffer management and
+     * HTTP/2, which is the closest available equivalent of the
+     * browser stack. If a future measurement shows this made no
+     * difference, the remaining candidate is Cronet itself.
+     */
+    private val downloadClient: OkHttpClient = OkHttpClient.Builder()
+        .connectTimeout(15, TimeUnit.SECONDS)
+        .readTimeout(120, TimeUnit.SECONDS)
+        .build()
+
+    private fun assetRequest(url: String, range: String? = null): Request {
+        val builder = Request.Builder()
+            .url(url)
+            .header("User-Agent", "AppsUpdater")
+            .header("Accept", "application/octet-stream")
+            .header("Cache-Control", "no-cache")
+        if (range != null) builder.header("Range", range)
+        return builder.build()
+    }
+
     /** Stream for one item: the release asset over HTTPS. */
     private fun openItemStream(context: Context, item: ApkItem): InputStream? {
         val url = item.downloadUrl ?: return null
-        val conn = (URL(url).openConnection() as HttpURLConnection).apply {
-            requestMethod = "GET"
-            connectTimeout = 15_000
-            readTimeout = 120_000
-            instanceFollowRedirects = true
-            setRequestProperty("User-Agent", "AppsUpdater")
-            setRequestProperty("Accept", "application/octet-stream")
-            setRequestProperty("Cache-Control", "no-cache")
-        }
-        if (conn.responseCode !in 200..299) {
-            val code = conn.responseCode
-            conn.disconnect()
+        val response = downloadClient.newCall(assetRequest(url)).execute()
+        if (!response.isSuccessful) {
+            val code = response.code
+            response.close()
             throw IllegalStateException("GitHub から取得できませんでした (HTTP $code)")
         }
-        return conn.inputStream
+        return response.body?.byteStream()
     }
 
     // -- package info -------------------------------------------------------
@@ -384,20 +408,20 @@ object Store {
      */
     // -- parallel (segmented) download --------------------------------------
     //
-    // A single HTTPS stream from the GitHub release-asset host to a
-    // phone in Japan plateaus far below the line's capacity
-    // (observed 2026-11-21: ~7 MB/s on a line fast.com measures at
-    // ~250 Mbps): one TCP flow over a long-RTT path cannot fill the
-    // pipe. The scan was parallelised in v0.2.0, but the asset
-    // download itself stayed single-stream until v0.2.3. Assets are
-    // now fetched as Range segments on several connections at once
-    // (the same asset host already answers Range requests — the
-    // package probe in PackageProbe relies on exactly that). Any
+    // The scan was parallelised in v0.2.0, but the asset download
+    // itself stayed single-stream until v0.2.3, when it was split
+    // into Range segments fetched on several connections at once
+    // (the asset host answers Range requests — the package probe
+    // in PackageProbe relies on exactly that). Parallelism alone
+    // did not raise the plateau on the user's device (see the
+    // downloadClient note: the transport stack was the limit, not
+    // the flow count), but segments stay: they cost nothing when
+    // the transport is healthy and they localise retries. Any
     // failure in the parallel path (no Range support, a short or
-    // failed segment) falls back to the original single stream, so
-    // a server quirk can never make a download impossible, only
-    // slower. The SHA-256 check afterwards is unchanged and covers
-    // the reassembled bytes either way.
+    // failed segment) falls back to the single stream, so a server
+    // quirk can never make a download impossible, only slower.
+    // The SHA-256 check afterwards is unchanged and covers the
+    // reassembled bytes either way.
 
     private const val PARALLEL_MIN_BYTES = 4L * 1024 * 1024
     private const val PARALLEL_MAX_SEGMENTS = 8
@@ -412,65 +436,43 @@ object Store {
     }
 
     /**
-     * Fetch one byte range [start, end] of [startUrl] into [file] at
-     * offset [start], following redirects manually (each redirect
-     * must re-carry the Range header; HttpURLConnection's automatic
-     * following does not guarantee that). Returns false when the
-     * server answers 200 instead of 206 (Range ignored) or the
-     * segment arrives short — the caller then falls back.
+     * Fetch one byte range [start, end] of [url] into [file] at
+     * offset [start]. OkHttp follows redirects itself and re-sends
+     * the Range header on redirect (it only strips Authorization),
+     * which the manual redirect loop in the HttpURLConnection era
+     * had to do by hand. Returns false when the server answers
+     * 200 instead of 206 (Range ignored) or the segment arrives
+     * short — the caller then falls back.
      */
     private fun fetchSegment(
-        file: File, startUrl: String, start: Long, end: Long,
+        file: File, url: String, start: Long, end: Long,
         onChunk: (Int) -> Unit
     ): Boolean {
-        var url = startUrl
-        var redirects = 0
-        while (true) {
-            var conn: HttpURLConnection? = null
-            try {
-                conn = (URL(url).openConnection() as HttpURLConnection).apply {
-                    requestMethod = "GET"
-                    connectTimeout = 15_000
-                    readTimeout = 120_000
-                    instanceFollowRedirects = false
-                    setRequestProperty("User-Agent", "AppsUpdater")
-                    setRequestProperty("Accept", "application/octet-stream")
-                    setRequestProperty("Cache-Control", "no-cache")
-                    setRequestProperty("Range", "bytes=$start-$end")
-                }
-                when (val code = conn.responseCode) {
-                    in 300..399 -> {
-                        val location = conn.getHeaderField("Location") ?: return false
-                        if (++redirects > 5) return false
-                        url = URL(URL(url), location).toString()
-                    }
-                    206 -> {
-                        val want = end - start + 1
-                        var got = 0L
-                        RandomAccessFile(file, "rw").use { raf ->
-                            raf.seek(start)
-                            conn.inputStream.use { input ->
-                                val buf = ByteArray(256 * 1024)
-                                while (got < want) {
-                                    val n = input.read(
-                                        buf, 0, minOf(buf.size.toLong(), want - got).toInt()
-                                    )
-                                    if (n < 0) break
-                                    raf.write(buf, 0, n)
-                                    got += n
-                                    onChunk(n)
-                                }
-                            }
+        return try {
+            downloadClient.newCall(assetRequest(url, "bytes=$start-$end")).execute().use { response ->
+                if (response.code != 206) return false
+                val input = response.body?.byteStream() ?: return false
+                val want = end - start + 1
+                var got = 0L
+                RandomAccessFile(file, "rw").use { raf ->
+                    raf.seek(start)
+                    input.use { stream ->
+                        val buf = ByteArray(256 * 1024)
+                        while (got < want) {
+                            val n = stream.read(
+                                buf, 0, minOf(buf.size.toLong(), want - got).toInt()
+                            )
+                            if (n < 0) break
+                            raf.write(buf, 0, n)
+                            got += n
+                            onChunk(n)
                         }
-                        return got == want
                     }
-                    else -> return false
                 }
-            } catch (e: Exception) {
-                return false
-            } finally {
-                conn?.disconnect()
+                got == want
             }
+        } catch (e: Exception) {
+            false
         }
     }
 

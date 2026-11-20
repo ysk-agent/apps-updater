@@ -11,8 +11,8 @@ android {
         applicationId = "dev.moriya.appsupdater"
         minSdk = 29
         targetSdk = 34
-        versionCode = 18
-        versionName = "0.2.3"
+        versionCode = 19
+        versionName = "0.2.4"
     }
 
     // Pinned signing key, same pattern as yt-player / phone-node-waker:
@@ -50,8 +50,14 @@ android {
     }
 }
 
-// No dependencies on purpose: the whole app is framework APIs only
-// (MediaStore, PackageInstaller, HttpURLConnection), which keeps
-// the APK small and the build free of dependency surprises.
+// The app was framework-APIs-only until v0.2.3. v0.2.4 adds
+// OkHttp for the asset download path only: on a real device the
+// platform HttpURLConnection stack plateaued at ~5 MB/s for
+// release assets (single and 8-way parallel alike) while Chrome
+// pulled the same asset at ~21 MB/s on the same phone and WiFi,
+// so the transport, not the network, was the bottleneck. The
+// scan/API path keeps using HttpURLConnection (small JSON,
+// unaffected).
 dependencies {
+    implementation("com.squareup.okhttp3:okhttp:4.12.0")
 }
