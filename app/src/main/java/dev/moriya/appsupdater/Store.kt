@@ -12,7 +12,10 @@ import android.provider.MediaStore
 import org.json.JSONArray
 import org.json.JSONObject
 import java.io.File
+import java.io.InputStream
 import java.io.RandomAccessFile
+import java.net.HttpURLConnection
+import java.net.URL
 import java.nio.ByteBuffer
 import java.security.MessageDigest
 import java.util.concurrent.CountDownLatch
@@ -315,17 +318,115 @@ object Store {
      * unaffected).
      */
     @Volatile private var cronetEngine: CronetEngine? = null
+    @Volatile private var cronetUnavailable = false
 
-    private fun cronet(context: Context): CronetEngine {
+    /**
+     * The shared Cronet engine, or null when Play services
+     * cannot provide one (de-Googled devices, stale GMS). The
+     * failure is cached and logged once; download paths then use
+     * the legacy HttpURLConnection implementation below, so a
+     * missing engine can never make downloads impossible.
+     */
+    private fun cronetOrNull(context: Context): CronetEngine? {
+        if (cronetUnavailable) return null
         cronetEngine?.let { return it }
         synchronized(this) {
+            if (cronetUnavailable) return null
             cronetEngine?.let { return it }
-            val engine = CronetEngine.Builder(context.applicationContext)
-                .enableHttp2(true)
-                .enableQuic(true)
-                .build()
-            cronetEngine = engine
-            return engine
+            return try {
+                val engine = CronetEngine.Builder(context.applicationContext)
+                    .enableHttp2(true)
+                    .enableQuic(true)
+                    .build()
+                cronetEngine = engine
+                engine
+            } catch (e: Exception) {
+                cronetUnavailable = true
+                Timing.logLine(
+                    "cronet unavailable (${e.javaClass.simpleName}); " +
+                        "downloads fall back to HttpURLConnection"
+                )
+                null
+            }
+        }
+    }
+
+    /** Legacy stream for one item (HttpURLConnection), used only
+     *  when Cronet is unavailable on the device. */
+    private fun openItemStreamLegacy(context: Context, item: ApkItem): InputStream? {
+        val url = item.downloadUrl ?: return null
+        val conn = (URL(url).openConnection() as HttpURLConnection).apply {
+            requestMethod = "GET"
+            connectTimeout = 15_000
+            readTimeout = 120_000
+            instanceFollowRedirects = true
+            setRequestProperty("User-Agent", "AppsUpdater")
+            setRequestProperty("Accept", "application/octet-stream")
+            setRequestProperty("Cache-Control", "no-cache")
+        }
+        if (conn.responseCode !in 200..299) {
+            val code = conn.responseCode
+            conn.disconnect()
+            throw IllegalStateException("GitHub から取得できませんでした (HTTP $code)")
+        }
+        return conn.inputStream
+    }
+
+    /** Legacy segment fetch (HttpURLConnection, manual redirects
+     *  re-carrying the Range header), used only when Cronet is
+     *  unavailable on the device. */
+    private fun fetchSegmentLegacy(
+        file: File, startUrl: String, start: Long, end: Long,
+        onChunk: (Int) -> Unit
+    ): Boolean {
+        var url = startUrl
+        var redirects = 0
+        while (true) {
+            var conn: HttpURLConnection? = null
+            try {
+                conn = (URL(url).openConnection() as HttpURLConnection).apply {
+                    requestMethod = "GET"
+                    connectTimeout = 15_000
+                    readTimeout = 120_000
+                    instanceFollowRedirects = false
+                    setRequestProperty("User-Agent", "AppsUpdater")
+                    setRequestProperty("Accept", "application/octet-stream")
+                    setRequestProperty("Cache-Control", "no-cache")
+                    setRequestProperty("Range", "bytes=$start-$end")
+                }
+                when (val code = conn.responseCode) {
+                    in 300..399 -> {
+                        val location = conn.getHeaderField("Location") ?: return false
+                        if (++redirects > 5) return false
+                        url = URL(URL(url), location).toString()
+                    }
+                    206 -> {
+                        val want = end - start + 1
+                        var got = 0L
+                        RandomAccessFile(file, "rw").use { raf ->
+                            raf.seek(start)
+                            conn.inputStream.use { input ->
+                                val buf = ByteArray(256 * 1024)
+                                while (got < want) {
+                                    val n = input.read(
+                                        buf, 0, minOf(buf.size.toLong(), want - got).toInt()
+                                    )
+                                    if (n < 0) break
+                                    raf.write(buf, 0, n)
+                                    got += n
+                                    onChunk(n)
+                                }
+                            }
+                        }
+                        return got == want
+                    }
+                    else -> return false
+                }
+            } catch (e: Exception) {
+                return false
+            } finally {
+                conn?.disconnect()
+            }
         }
     }
 
@@ -392,7 +493,9 @@ object Store {
         }
         val executor = Executors.newSingleThreadExecutor()
         try {
-            val builder = cronet(context).newUrlRequestBuilder(url, callback, executor)
+            val engine = cronetOrNull(context)
+                ?: throw IllegalStateException("cronet unavailable")
+            val builder = engine.newUrlRequestBuilder(url, callback, executor)
                 .setHttpMethod("GET")
                 .addHeader("User-Agent", "AppsUpdater")
                 .addHeader("Accept", "application/octet-stream")
@@ -518,6 +621,9 @@ object Store {
         context: Context, file: File, url: String, start: Long, end: Long,
         onChunk: (Int) -> Unit
     ): Boolean {
+        if (cronetOrNull(context) == null) {
+            return fetchSegmentLegacy(file, url, start, end, onChunk)
+        }
         return try {
             var got = 0L
             RandomAccessFile(file, "rw").use { raf ->
@@ -606,6 +712,22 @@ object Store {
             // reassembled file (a local read, far faster than the
             // network path it replaces).
             sha = sha256Of(tmp)
+        } else if (cronetOrNull(context) == null) {
+            val digest = MessageDigest.getInstance("SHA-256")
+            openItemStreamLegacy(context, item)?.use { input ->
+                tmp.outputStream().use { output ->
+                    val buf = ByteArray(256 * 1024)
+                    while (true) {
+                        val n = input.read(buf)
+                        if (n < 0) break
+                        output.write(buf, 0, n)
+                        digest.update(buf, 0, n)
+                        copied += n
+                        onProgress(copied, item.size)
+                    }
+                }
+            } ?: throw IllegalStateException("APK を開けませんでした")
+            sha = digest.digest().joinToString("") { "%02x".format(it) }
         } else {
             val url = item.downloadUrl
                 ?: throw IllegalStateException("APK を開けませんでした")
