@@ -44,6 +44,11 @@ import kotlin.concurrent.thread
  *   am start -n dev.moriya.appsupdater/.MainActivity \
  *     --es auto_project phone-node-waker --es auto_file phone-node-waker.apk
  * starts the download of that one item as soon as the list is built.
+ * Adding `--ez auto_install true` (v0.2.6) makes Apps Updater itself
+ * install the item through its own PackageInstaller flow as soon as
+ * the download completes and verifies, instead of leaving the file
+ * for `adb shell pm install` — so Apps Updater, not the shell,
+ * becomes the installer of record for that update.
  */
 class MainActivity : Activity() {
 
@@ -71,6 +76,7 @@ class MainActivity : Activity() {
 
     private var autoProject: String? = null
     private var autoFile: String? = null
+    private var autoInstall: Boolean = false
     private var autoConsumed = false
 
     private class Row(
@@ -219,6 +225,7 @@ class MainActivity : Activity() {
     private fun readAutoExtras(intent: Intent?) {
         autoProject = intent?.getStringExtra("auto_project")
         autoFile = intent?.getStringExtra("auto_file")
+        autoInstall = intent?.getBooleanExtra("auto_install", false) ?: false
     }
 
     /**
@@ -557,7 +564,7 @@ class MainActivity : Activity() {
         runOnUiThread { row.status.text = text }
     }
 
-    private fun startDownload(row: Row) {
+    private fun startDownload(row: Row, installAfter: Boolean = false) {
         if (row.downloading) return
         val item = row.item
         // Since v0.1.9 the transfer itself runs in DownloadService,
@@ -572,7 +579,7 @@ class MainActivity : Activity() {
         row.progress.progress = 0
         setRowStatus(row, "ダウンロード中: ${item.fileName}")
         try {
-            DownloadService.start(this, item)
+            DownloadService.start(this, item, installAfter)
         } catch (e: Exception) {
             row.downloading = false
             row.progress.visibility = View.GONE
@@ -663,7 +670,7 @@ class MainActivity : Activity() {
             ?: rows.firstOrNull { it.item.fileName == file }
             ?: return
         autoConsumed = true
-        startDownload(row)
+        startDownload(row, installAfter = autoInstall)
     }
 
     // -- helpers ---------------------------------------------------------------

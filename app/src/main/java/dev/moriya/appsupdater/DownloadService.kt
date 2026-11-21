@@ -43,6 +43,7 @@ class DownloadService : Service() {
             stopSelf(startId)
             return START_NOT_STICKY
         }
+        val installAfter = intent.getBooleanExtra(X_INSTALL_AFTER, false)
         if (!running) {
             running = true
             startForegroundWith(notificationFor(item, 0, item.size, indeterminate = true))
@@ -50,9 +51,12 @@ class DownloadService : Service() {
         synchronized(this) { activeJobs++ }
         executor.execute {
             try {
-                val text = Store.runDownload(this, item) { copied, total ->
+                var text = Store.runDownload(this, item) { copied, total ->
                     broadcastProgress(item.fileName, copied, total, done = false, status = null)
                     updateNotification(item, copied, total)
+                }
+                if (installAfter && text.startsWith("ダウンロード完了")) {
+                    text = installDownloaded(item, text)
                 }
                 broadcastProgress(item.fileName, item.size, item.size, done = true, status = text)
             } finally {
@@ -60,6 +64,37 @@ class DownloadService : Service() {
             }
         }
         return START_NOT_STICKY
+    }
+
+    /**
+     * Install a just-downloaded item through this app's own
+     * PackageInstaller flow (the auto_install automation path,
+     * v0.2.6). Runs only after [Store.runDownload] has verified the
+     * bytes; the file is re-hashed here as well, mirroring the
+     * in-app install button, so what is installed is checked at
+     * install time too. The outcome of the install itself (success,
+     * or a pending user confirmation) is reported by
+     * InstallReceiver, which overwrites the status set here.
+     */
+    private fun installDownloaded(item: ApkItem, downloadText: String): String {
+        val text = try {
+            if (!packageManager.canRequestPackageInstalls()) {
+                "ダウンロード完了しましたが、「不明なアプリのインストール」が未許可のためインストールを開始できませんでした: ${item.fileName}"
+            } else {
+                val expected = item.update?.sha256
+                val actual = Store.sha256Of(Store.downloadedFile(this, item.fileName))
+                if (expected != null && !expected.equals(actual, ignoreCase = true)) {
+                    "保存済みファイルの SHA-256 が現在のリリースと一致しないためインストールしません。期待 ${expected.take(12)}… / 実際 ${actual.take(12)}…: ${item.fileName}"
+                } else {
+                    Store.install(this, item)
+                    "インストール開始 (Apps Updater 経由): ${item.fileName}"
+                }
+            }
+        } catch (e: Exception) {
+            "インストール開始に失敗: ${e.javaClass.simpleName}: ${e.message}: ${item.fileName}"
+        }
+        Store.setStatus(this, item.fileName, text, Store.statusKeyFor(item))
+        return if (text.startsWith("インストール開始")) text else "$downloadText\n$text"
     }
 
     @Volatile private var activeJobs = 0
@@ -174,13 +209,17 @@ class DownloadService : Service() {
         private const val X_U_BUILD_ID = "u_buildId"
         private const val X_U_SHA256 = "u_sha256"
         private const val X_U_SIZE = "u_size"
+        private const val X_INSTALL_AFTER = "installAfter"
 
         /** Start (or enqueue) the download of one item. Must be
          *  called while the app is in the foreground (activity tap
          *  or the am-start auto flow), as startForegroundService
-         *  requires. */
-        fun start(context: Context, item: ApkItem) {
+         *  requires. With [installAfter] the service itself installs
+         *  the item through the app's PackageInstaller flow once the
+         *  download verifies (the auto_install automation path). */
+        fun start(context: Context, item: ApkItem, installAfter: Boolean = false) {
             val intent = Intent(context, DownloadService::class.java).apply {
+                putExtra(X_INSTALL_AFTER, installAfter)
                 putExtra(X_PROJECT, item.project)
                 putExtra(X_FILENAME, item.fileName)
                 putExtra(X_SOURCE, item.source)

@@ -172,6 +172,16 @@ and `pm install` cannot read `/sdcard` paths there (FUSE scoped
 storage; system_server is denied), so the install stages the APK
 through `/data/local/tmp` with an on-device copy first.
 
+With `--install-via-updater` (v0.2.6+) the trigger also carries
+`auto_install=true`: Apps Updater itself then installs the
+downloaded APK through its own PackageInstaller flow, so Apps
+Updater — not the shell — is the installer of record for that
+update (the status later unattended updates depend on). The
+script waits for the target package's `lastUpdateTime` to change
+instead of running `pm install`; if the platform demands a user
+confirmation, the install waits on the device's confirmation
+notification and the wait times out.
+
 ## update.json format
 
 Publishers attach an `update.json` asset to each release. Since
